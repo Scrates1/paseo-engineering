@@ -57,6 +57,9 @@ if mode == "daemon-down":
 if mode == "fail":
     sys.stderr.write("Error: internal workspace failure\n")
     sys.exit(1)
+if mode == "garbage" and argv[:2] == ["provider", "ls"]:
+    print("this is not json")
+    sys.exit(0)
 db_path = root / "workspaces.json"
 db = json.loads(db_path.read_text()) if db_path.exists() else {}
 
@@ -189,10 +192,9 @@ class FlowTestBase(unittest.TestCase):
             return []
         return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 
-    def models_file(self, models) -> str:
-        path = self.tmp / f"online-{len(list(self.tmp.glob('online-*')))}.json"
-        path.write_text(json.dumps(models))
-        return str(path)
+    def ledger_snapshot(self):
+        return ((self.run_dir / "state.json").read_bytes(), (self.run_dir / "status.md").read_bytes(),
+                self.git(self.repo, "rev-parse", "HEAD"))
 
     def gear1_ready(self, slices="main-fix"):
         self.flow("init", "--repo", str(self.repo))
@@ -469,15 +471,41 @@ class PaseoBackendTest(FlowTestBase):
     def test_single_family_host_is_verified_not_self_reported(self) -> None:
         self.gear1_ready()
         self.implement("main-fix", "fix/answer")
-        multi = self.models_file(["claude/opus", "codex/gpt-6.1-sol"])
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"], "codex": ["gpt-6.1-sol"]})
         self.reject("enter-review", "--slice", "main-fix", "--reviewer-model", "claude/sonnet", "--single-family-host",
-                    glob=["--online-models-json", multi], contains="REJECTED")
+                    contains="REJECTED")
         os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"], "antigravity": ["gemini-4-neon-xhigh"]})
         self.reject("enter-review", "--slice", "main-fix", "--reviewer-model", "claude/sonnet", "--single-family-host",
                     contains="2 distinct model families")
         os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus", "sonnet"]})
         self.flow("enter-review", "--slice", "main-fix", "--reviewer-model", "claude/sonnet", "--single-family-host")
         self.assertTrue(self.slice("main-fix")["active_lenses"]["default"]["single_family_host"])
+
+    def test_online_models_json_flag_is_removed(self) -> None:
+        self.gear1_ready()
+        path = self.tmp / "fake.json"
+        path.write_text(json.dumps(["claude/opus"]))
+        before = (self.run_dir / "state.json").read_bytes()
+        self.reject("status", glob=["--online-models-json", str(path)])
+        self.assertEqual((self.run_dir / "state.json").read_bytes(), before)
+        self.assertFalse(hasattr(flow.Ctx(self.run_dir, None), "online_models_json"))
+
+    def test_single_family_host_rejects_empty_unparseable_and_foreign_family(self) -> None:
+        self.gear1_ready()
+        self.implement("main-fix", "fix/answer")
+        args = ("enter-review", "--slice", "main-fix", "--reviewer-model", "claude/sonnet", "--single-family-host")
+        os.environ["MOCK_PASEO_PROVIDERS"] = "{}"
+        self.reject(*args, contains="0 online model families")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": []})
+        self.reject(*args, contains="0 online model families")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"codex": ["gpt-6.1-sol"]})
+        self.reject(*args, contains="not the sole online family")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"]})
+        os.environ["MOCK_PASEO_MODE"] = "garbage"
+        self.reject(*args, contains="cannot verify")
+        os.environ["MOCK_PASEO_MODE"] = "daemon-down"
+        self.reject(*args, contains="cannot verify")
+        self.assertEqual(self.slice("main-fix")["state"], "IMPLEMENTING")
 
 
 class GearTwoFlowTest(FlowTestBase):
@@ -597,12 +625,11 @@ class GearTwoFlowTest(FlowTestBase):
         self.flow("triage", "--symptom", "s", "--root", "r", "--gear", "2")
         self.flow("record-explore", "--author-models", "claude/opus", "--summary", "e")
         self.reject("record-redteam", "--model", "antigravity/claude-opus-5-5-high", "--summary", "x", contains="heterogeneous")
-        multi = self.models_file({"claude": ["opus"], "codex": ["gpt-6.1-sol"]})
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"], "codex": ["gpt-6.1-sol"]})
         self.reject("record-redteam", "--model", "claude/sonnet", "--summary", "x", "--single-family-host",
-                    glob=["--online-models-json", multi], contains="REJECTED")
-        single = self.models_file({"claude": ["opus", "sonnet"]})
-        self.flow("record-redteam", "--model", "claude/sonnet", "--summary", "x", "--single-family-host",
-                  glob=["--online-models-json", single])
+                    contains="REJECTED")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus", "sonnet"]})
+        self.flow("record-redteam", "--model", "claude/sonnet", "--summary", "x", "--single-family-host")
         self.assertEqual(self.state()["state"], "FALSIFIED")
 
     def test_probe_is_evidence_only(self) -> None:
@@ -691,7 +718,6 @@ class GearThreeFlowTest(FlowTestBase):
     def test_spike_go(self) -> None:
         self.spike_audited("go")
         wt = self.wt("s1")
-        self.reject("decide-spike", "--slice", "s1", "--decision", "go", "--summary", "win")
         self.flow("decide-spike", "--slice", "s1", "--decision", "go", "--summary", "win", "--slices", "prod")
         st = self.state()
         self.assertEqual((st["gear"], st["state"], st["aligned_slices"]), (2, "ALIGNED", ["prod"]))
@@ -701,6 +727,19 @@ class GearThreeFlowTest(FlowTestBase):
         self.flow("record-prereview", "--reviewer-a-model", REVIEWER, "--reviewer-b-model", REVIEWER_B,
                   "--planned-worker-models", WORKER, "--blockers", "0")
         self.flow("isolate", "--slice", "prod", "--branch", "feat/prod")
+
+    def test_spike_go_default_slices_and_realign_in_aligned(self) -> None:
+        self.spike_audited("godefault")
+        self.flow("decide-spike", "--slice", "s1", "--decision", "go", "--summary", "win")
+        st = self.state()
+        self.assertEqual((st["gear"], st["state"], st["aligned_slices"]), (2, "ALIGNED", ["s1-prod"]))
+        self.flow("align", "--slices", "api,db", "--summary", "split production work")
+        st = self.state()
+        self.assertEqual((st["state"], st["aligned_slices"]), ("ALIGNED", ["api", "db"]))
+        self.flow("record-prereview", "--reviewer-a-model", REVIEWER, "--reviewer-b-model", REVIEWER_B,
+                  "--planned-worker-models", WORKER, "--blockers", "0")
+        self.reject("isolate", "--slice", "s1-prod", "--branch", "feat/old")
+        self.flow("isolate", "--slice", "api", "--branch", "feat/api")
 
     def test_spike_pivot(self) -> None:
         self.spike_audited("pivot")
@@ -715,13 +754,219 @@ class GearThreeFlowTest(FlowTestBase):
         self.assertEqual(self.git(self.repo, "branch", "--list", "spike/kill"), "")
 
 
+class PostReviewHardeningTest(FlowTestBase):
+    """Regression suite for the cross-model post-review blockers on the first gatekeeper commit."""
+
+    def test_every_mutating_command_rechecks_main_snapshot(self) -> None:
+        (self.repo / "notes.txt").write_text("a")
+        self.flow("init", "--repo", str(self.repo))
+        before = self.ledger_snapshot()
+        (self.repo / "notes.txt").write_text("ab")
+        self.reject("triage", "--symptom", "s", "--root", "r", "--gear", "2", contains="working tree changed")
+        self.assertEqual(self.ledger_snapshot(), before)
+        (self.repo / "notes.txt").write_text("a")
+        self.flow("triage", "--symptom", "s", "--root", "r", "--gear", "2")
+        before = self.ledger_snapshot()
+        (self.repo / "notes.txt").write_text("ab")
+        self.reject("record-explore", "--author-models", WORKER, "--summary", "e", contains="working tree changed")
+        self.assertEqual(self.ledger_snapshot(), before)
+        self.assertEqual(self.state()["state"], "TRIAGED")
+        (self.repo / "notes.txt").write_text("a")
+        self.commit(self.repo, "rogue.txt", "rogue\n", "rogue")
+        before = self.ledger_snapshot()
+        self.reject("record-explore", "--author-models", WORKER, "--summary", "e", contains="HEAD drifted")
+        self.reject("triage", "--symptom", "s", "--root", "r", "--gear", "1", "--re-triage", contains="HEAD drifted")
+        self.assertEqual(self.ledger_snapshot(), before)
+        self.flow("status")
+
+    def test_gear2_worker_family_bound_to_prereview_credentials(self) -> None:
+        self.gear2_ready(slices="a")
+        self.assertEqual(self.state()["prereview_reviewer_families"], ["google", "openai"])
+        self.flow("isolate", "--slice", "a", "--branch", "feat/a")
+        for model in (REVIEWER, "codex/gpt-6.2-astra", REVIEWER_B, "gemini-4-carbon-high"):
+            self.reject("assign-worker", "--slice", "a", "--model", model, contains="pre-reviewer families")
+        self.reject("assign-worker", "--slice", "a", "--model", "gpt-6.1-sol", "--provider", "codex")
+        self.assertEqual(self.slice("a")["state"], "ISOLATED")
+        self.flow("assign-worker", "--slice", "a", "--model", WORKER)
+        self.reject("assign-worker", "--slice", "a", "--model", REVIEWER, contains="pre-reviewer families")
+        self.assertEqual(self.slice("a")["worker_family"], "anthropic")
+        self.flow("triage", "--symptom", "s", "--root", "r", "--gear", "2", "--re-triage")
+        st = self.state()
+        for key in ("prereview", "prereview_reviewer_families", "prereview_single_family"):
+            self.assertNotIn(key, st)
+
+    def test_prereview_single_family_exemption_is_verified(self) -> None:
+        self.flow("init", "--repo", str(self.repo))
+        self.flow("triage", "--symptom", "s", "--root", "r", "--gear", "2")
+        self.flow("align", "--slices", "a", "--user-override", "user said run directly")
+        self.flow("align", "--slices", "a,b")
+        args = ("record-prereview", "--reviewer-a-model", "claude/sonnet", "--reviewer-b-model", "claude-haiku-5",
+                "--planned-worker-models", WORKER, "--blockers", "0")
+        self.reject(*args, contains="HARD GATE")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"], "codex": ["gpt-6.1-sol"]})
+        self.reject(*args, "--single-family-host", contains="REJECTED")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus", "sonnet", "haiku"]})
+        self.flow(*args, "--single-family-host")
+        st = self.state()
+        self.assertEqual((st["prereview_reviewer_families"], st["prereview_single_family"]), (["anthropic"], True))
+        self.flow("isolate", "--slice", "a", "--branch", "feat/a")
+        self.flow("assign-worker", "--slice", "a", "--model", WORKER)
+
+    def _dirty_main_integrated_into_worktree(self):
+        (self.repo / "README.md").write_text("user wip\n")
+        (self.repo / "local.cfg").write_text("secret=1\n")
+        self.gear1_ready()
+        self.flow("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--apply-dirty-patch")
+        self.flow("assign-worker", "--slice", "main-fix", "--model", WORKER)
+        self.commit(self.wt("main-fix"), "app.py", "def answer():\n    return 42\n", "fix")
+        self.flow("enter-review", "--slice", "main-fix", "--reviewer-model", REVIEWER)
+        self.flow("record-review", "--slice", "main-fix", "--verdict", "PASS", "--blockers", "0")
+        integ = self.tmp / "integration"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(integ), self.state()["expected_main_head_sha"])
+        self.flow("integrate", "--slice", "main-fix", "--into-worktree", str(integ))
+        self.assertEqual(self.state()["state"], "MERGED_PENDING_VERIFY")
+        return integ
+
+    def test_verify_integration_into_worktree_integrity_before_and_after_cmd(self) -> None:
+        integ = self._dirty_main_integrated_into_worktree()
+        wt = self.wt("main-fix")
+
+        def assert_pending():
+            self.assertEqual(self.state()["state"], "MERGED_PENDING_VERIFY")
+            self.assertTrue(wt.exists())
+            self.assertNotEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
+
+        (integ / "junk.txt").write_text("x")
+        before = self.ledger_snapshot()
+        self.reject("verify-integration", "--cmd", "exit 0", contains="untracked")
+        self.assertEqual(self.ledger_snapshot(), before)
+        (integ / "junk.txt").unlink()
+        (integ / "app.py").write_text("tampered\n")
+        self.reject("verify-integration", "--cmd", "exit 0", contains="before --cmd")
+        self.git(integ, "checkout", "--", "app.py")
+        (self.repo / "local.cfg").write_text("secret=2\n")
+        self.reject("verify-integration", "--cmd", "exit 0", contains="working tree changed")
+        (self.repo / "local.cfg").write_text("secret=1\n")
+        assert_pending()
+        self.flow("verify-integration", "--cmd", "touch leftover.txt", expect=flow.EXIT_VERIFY_FAILED)
+        assert_pending()
+        self.assertIn("after --cmd", self.state()["verifications"][-1]["integrity_failure"])
+        (integ / "leftover.txt").unlink()
+        self.flow("verify-integration", "--cmd", "echo more >> app.py", expect=flow.EXIT_VERIFY_FAILED)
+        assert_pending()
+        self.git(integ, "checkout", "--", "app.py")
+        self.flow("verify-integration", "--cmd", "grep -q 42 app.py")
+        self.assertEqual(self.state()["state"], "COMPLETED")
+        self.assertFalse(wt.exists())
+
+    def test_verify_integration_in_place_rejects_cmd_that_dirties_repo(self) -> None:
+        self.gear1_ready()
+        self.implement("main-fix", "fix/answer")
+        self.flow("enter-review", "--slice", "main-fix", "--reviewer-model", REVIEWER)
+        self.flow("record-review", "--slice", "main-fix", "--verdict", "PASS", "--blockers", "0")
+        self.flow("integrate", "--slice", "main-fix")
+        wt = self.wt("main-fix")
+        self.flow("verify-integration", "--cmd", "echo x >> README.md", expect=flow.EXIT_VERIFY_FAILED)
+        self.assertEqual(self.state()["state"], "MERGED_PENDING_VERIFY")
+        self.assertTrue(wt.exists())
+        self.git(self.repo, "checkout", "--", "README.md")
+        self.flow("verify-integration", "--cmd", "touch build.log", expect=flow.EXIT_VERIFY_FAILED)
+        self.assertEqual(self.state()["state"], "MERGED_PENDING_VERIFY")
+        self.assertTrue(wt.exists())
+        (self.repo / "build.log").unlink()
+        self.flow("verify-integration", "--cmd", "grep -q 42 app.py")
+        self.assertEqual(self.state()["state"], "COMPLETED")
+        self.assertFalse(wt.exists())
+
+    def test_mark_rebased_tracks_latest_target_head(self) -> None:
+        self.gear2_ready(slices="a,b,c")
+        self.implement("a", "feat/a", content="def answer():\n    return 42\n")
+        self.implement("b", "feat/b", content="def answer():\n    return 43\n")
+        self.implement("c", "feat/c", rel="c.txt", content="independent\n")
+        for sid in ("a", "b", "c"):
+            self.pass_gear2(sid)
+        self.flow("integrate", "--slice", "a")
+        head_a = self.git(self.repo, "rev-parse", "HEAD")
+        self.flow("integrate", "--slice", "b", expect=flow.EXIT_CONFLICT)
+        self.assertEqual(self.slice("b")["required_rebase_target"], head_a)
+        self.flow("integrate", "--slice", "c")
+        head_c = self.git(self.repo, "rev-parse", "HEAD")
+        self.assertNotEqual(head_a, head_c)
+        self.assertEqual(self.state()["expected_main_head_sha"], head_c)
+        wtb = self.wt("b")
+        self.git(wtb, "reset", "-q", "--hard", head_c)
+        self.commit(wtb, "b.txt", "b rebased\n", "rebased b")
+        self.reject("mark-rebased", "--slice", "b", "--new-slice-base", head_a, contains="rebase target")
+        self.flow("mark-rebased", "--slice", "b", "--new-slice-base", head_c)
+        self.pass_gear2("b")
+        self.flow("integrate", "--slice", "b")
+        self.assertEqual(self.state()["state"], "MERGED_PENDING_VERIFY")
+        self.flow("verify-integration", "--cmd", "test -f b.txt && test -f c.txt && grep -q 42 app.py")
+        self.assertEqual(self.state()["state"], "COMPLETED")
+
+    def test_user_override_ledger_cannot_bypass_physical_gates(self) -> None:
+        self.flow("init", "--repo", str(self.repo))
+        self.flow("triage", "--symptom", "s", "--root", "r", "--gear", "2")
+        self.flow("isolate", "--slice", "a", "--branch", "feat/a", "--user-override", "user said run directly")
+        self.flow("assign-worker", "--slice", "a", "--model", WORKER)
+        self.commit(self.wt("a"), "app.py", "def answer():\n    return 42\n")
+
+        def blocked(*args, contains=None):
+            before = self.ledger_snapshot()
+            sl = self.slice("a")
+            self.reject(*args, contains=contains)
+            after = self.slice("a")
+            self.assertEqual(self.ledger_snapshot(), before)
+            self.assertEqual((after["state"], after["approved_head_sha"]), (sl["state"], sl["approved_head_sha"]))
+
+        for parser_reject in (("enter-review", "--slice", "a", "--reviewer-model", REVIEWER, "--lens", "A",
+                               "--user-override", "please"),
+                              ("integrate", "--slice", "a", "--user-override", "please")):
+            blocked(*parser_reject)
+        blocked("enter-review", "--slice", "a", "--reviewer-model", "claude/sonnet", "--lens", "A", contains="HARD GATE #2")
+        blocked("enter-review", "--slice", "a", "--reviewer-model", "antigravity/claude-opus-5-5-high", "--lens", "B",
+                contains="HARD GATE #2")
+        blocked("integrate", "--slice", "a", contains="HARD GATE #5")
+        self.flow("enter-review", "--slice", "a", "--reviewer-model", REVIEWER, "--lens", "A")
+        self.flow("record-review", "--slice", "a", "--verdict", "PASS", "--blockers", "0", "--lens", "A")
+        blocked("integrate", "--slice", "a", contains="HARD GATE #5")
+        self.assertIsNone(self.slice("a")["approved_head_sha"])
+
+        self.run_dir = self.tmp / "run-spike"
+        self.flow("init", "--repo", str(self.repo))
+        self.flow("triage", "--symptom", "s", "--root", "r", "--gear", "3")
+        self.flow("record-explore", "--author-models", WORKER, "--summary", "recon")
+        self.flow("align", "--slices", "a", "--spike-hypothesis", "h", "--spike-samples", "s", "--go-criteria", "g",
+                  "--user-override", "skip premortem per user")
+        self.flow("isolate", "--slice", "a", "--branch", "spike/a", "--kind", "spike")
+        self.flow("assign-worker", "--slice", "a", "--model", WORKER)
+        self.commit(self.wt("a"), "bench.txt", "numbers\n")
+        blocked("enter-review", "--slice", "a", "--reviewer-model", "claude/sonnet", "--lens", "audit",
+                contains="HARD GATE #2")
+        self.flow("enter-review", "--slice", "a", "--reviewer-model", REVIEWER, "--lens", "audit")
+        self.flow("record-review", "--slice", "a", "--verdict", "PASS", "--blockers", "0", "--lens", "audit")
+        blocked("integrate", "--slice", "a", contains="never be merged")
+        blocked("integrate", "--slice", "a", "--user-override", "merge it anyway")
+        self.assertEqual(self.slice("a")["state"], "SPIKE_AUDITED")
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "spike/a"), "")
+
+
 @unittest.skipIf(os.name == "nt", "POSIX permissions")
 class CliSmokeTest(unittest.TestCase):
     def test_flow_scripts_are_executable_identical_and_runnable(self) -> None:
         self.assertEqual(FLOW_PATH.read_bytes(), FLOW_ZH_PATH.read_bytes())
         for path in (FLOW_PATH, FLOW_ZH_PATH):
             self.assertTrue(path.read_text(encoding="utf-8").startswith("#!/usr/bin/env python3\n"))
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+            # Source-tree permissions depend on the cloner's umask (0775/0755/0700...): assert the
+            # executable bit and the committed git index mode instead of an exact st_mode.
+            self.assertTrue(os.access(str(path), os.X_OK), f"{path} is not executable")
+            in_git = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if in_git.returncode == 0:
+                rel = str(path.relative_to(REPO_ROOT))
+                entry = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "-s", "--", rel],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()
+                self.assertTrue(entry.startswith("100755 "), f"git index mode for {rel}: {entry!r}")
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         res = subprocess.run([sys.executable, str(FLOW_PATH), "--help"], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, env=env)

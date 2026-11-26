@@ -83,10 +83,9 @@ class PaseoUnavailable(FlowError):
 
 
 class Ctx:
-    def __init__(self, run_dir: Path, paseo_home: Optional[str], online_models_json: Optional[str]) -> None:
+    def __init__(self, run_dir: Path, paseo_home: Optional[str]) -> None:
         self.run_dir = run_dir
         self.paseo_home = paseo_home
-        self.online_models_json = online_models_json
 
 
 # --------------------------------------------------------------------------------------------
@@ -347,29 +346,13 @@ def pick_field(obj: Any, *keys: str) -> Optional[str]:
     return None
 
 
-def _flatten_models(data: Any) -> List[str]:
-    specs: List[str] = []
-    if isinstance(data, dict):
-        for provider, models in data.items():
-            for m in models if isinstance(models, list) else [models]:
-                specs.append(f"{provider}/{m}")
-    elif isinstance(data, list):
-        for item in data:
-            if isinstance(item, str):
-                specs.append(item)
-            elif isinstance(item, dict):
-                provider = item.get("provider") or ""
-                model = item.get("id") or item.get("model") or ""
-                specs.append(f"{provider}/{model}" if provider else str(model))
-    return [s for s in specs if s.strip()]
-
-
 def online_model_specs(ctx: Ctx) -> List[str]:
-    if ctx.online_models_json:
-        return _flatten_models(json.loads(Path(ctx.online_models_json).read_text(encoding="utf-8")))
+    """Live probe only (``paseo provider ls`` + ``provider models``); there is no offline override."""
     providers = parse_json_output(run_paseo(ctx, ["provider", "ls", "--json"]))
+    if not isinstance(providers, list):
+        raise FlowError(f"unexpected 'paseo provider ls --json' payload: {providers!r}")
     specs: List[str] = []
-    for item in providers if isinstance(providers, list) else []:
+    for item in providers:
         if not isinstance(item, dict):
             continue
         name = str(item.get("provider") or item.get("id") or "").strip()
@@ -378,25 +361,36 @@ def online_model_specs(ctx: Ctx) -> List[str]:
         if not name or status != "available" or enabled in ("disabled", "false"):
             continue
         models = parse_json_output(run_paseo(ctx, ["provider", "models", name, "--json"]))
-        for m in models if isinstance(models, list) else []:
-            mid = m.get("id") or m.get("model") if isinstance(m, dict) else m
+        if not isinstance(models, list):
+            raise FlowError(f"unexpected 'paseo provider models {name} --json' payload: {models!r}")
+        for m in models:
+            mid = (m.get("id") or m.get("model")) if isinstance(m, dict) else m
             if mid:
                 specs.append(f"{name}/{mid}")
     return specs
 
 
-def verify_single_family_host(ctx: Ctx) -> List[str]:
+def verify_single_family_host(ctx: Ctx, exempt_families: Any) -> str:
+    """Allow a same-family exemption only if exactly ONE family is live and it is the exempted one."""
     try:
         specs = online_model_specs(ctx)
+        families = sorted({normalize_family(s) for s in specs})
     except (FlowError, OSError, ValueError) as exc:
         raise FlowError(f"--single-family-host REJECTED: cannot verify online model families ({exc})")
-    families = sorted({normalize_family(s) for s in specs})
-    if len(families) >= 2:
+    if not families:
+        raise FlowError("--single-family-host REJECTED: live probe found 0 online model families")
+    if len(families) != 1:
         raise FlowError(
             f"--single-family-host REJECTED: {len(families)} distinct model families are online "
             f"({', '.join(families)}); use a reviewer from a different family instead"
         )
-    return families
+    sole = families[0]
+    foreign = sorted(set(exempt_families) - {sole})
+    if foreign:
+        raise FlowError(
+            f"--single-family-host REJECTED: exempted family {', '.join(foreign)} is not the sole online family {sole}"
+        )
+    return sole
 
 
 def paseo_create_worktree(ctx: Ctx, repo: Path, branch: str, base: str, background: bool) -> Tuple[str, str, Path]:
@@ -516,9 +510,15 @@ def bump_epoch(st: Dict[str, Any]) -> None:
     st["alignment_epoch"] = int(st.get("alignment_epoch", 0)) + 1
 
 
-def invalidate_credentials(st: Dict[str, Any], reason: str) -> None:
-    for key in ("explore", "redteam", "prereview", "alignment", "spike"):
+def clear_prereview(st: Dict[str, Any]) -> None:
+    for key in ("prereview", "prereview_reviewer_families", "prereview_single_family"):
         st.pop(key, None)
+
+
+def invalidate_credentials(st: Dict[str, Any], reason: str) -> None:
+    for key in ("explore", "redteam", "alignment", "spike"):
+        st.pop(key, None)
+    clear_prereview(st)
     st["aligned_slices"] = []
     for sl in st.get("slices", {}).values():
         if sl["state"] not in TERMINAL_SLICE_STATES and sl["state"] != "SUPERSEDED":
@@ -665,7 +665,7 @@ def cmd_record_redteam(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> s
     explore_fams = set(explore["families"])
     verified = False
     if a.single_family_host:
-        verify_single_family_host(ctx)
+        verify_single_family_host(ctx, explore_fams | {fam})
         verified = True
     if not {f for f in explore_fams if f != fam} and not verified:
         raise FlowError(
@@ -687,7 +687,7 @@ def cmd_align(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
     override = None
     if a.user_override is not None:
         override = non_empty(a.user_override, "--user-override")
-    normal = {2: ("FALSIFIED",), 3: ("PREMORTEM_DONE",)}
+    normal = {2: ("FALSIFIED", "ALIGNED"), 3: ("PREMORTEM_DONE",)}
     relaxed = {2: ("TRIAGED", "EXPLORED", "FALSIFIED"), 3: ("TRIAGED", "RECON_DONE", "PREMORTEM_DONE")}
     try:
         require_gear_state(st, normal, "align")
@@ -710,7 +710,7 @@ def cmd_align(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
         st["state"] = "ALIGNED"
     st["aligned_slices"] = slices
     st["alignment"] = {"summary": (a.summary or "").strip(), "auto_authorized": bool(a.auto_authorized), "at": now_iso()}
-    st.pop("prereview", None)
+    clear_prereview(st)
     bump_epoch(st)
     return f"aligned slices {', '.join(slices)}; task state {st['state']}"
 
@@ -727,10 +727,11 @@ def cmd_record_prereview(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) ->
     if a.blockers != 0:
         raise FlowError(f"pre-review reports {a.blockers} open blocker(s); resolve them and re-run record-prereview")
     worker_fams = {normalize_family(m) for m in planned}
+    reviewer_fams = sorted({normalize_family(m1), normalize_family(m2)})
     clashes = [m for m in (m1, m2) if normalize_family(m) in worker_fams]
     verified = False
     if a.single_family_host:
-        verify_single_family_host(ctx)
+        verify_single_family_host(ctx, worker_fams | set(reviewer_fams))
         verified = True
     if clashes and not verified:
         raise FlowError(
@@ -741,6 +742,8 @@ def cmd_record_prereview(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) ->
         "reviewer_a": m1, "reviewer_b": m2, "planned_workers": planned, "blockers": 0,
         "single_family_host": verified, "at": now_iso(),
     }
+    st["prereview_reviewer_families"] = reviewer_fams
+    st["prereview_single_family"] = verified
     st["state"] = "EXECUTION_READY"
     return "pre-review passed; task state EXECUTION_READY"
 
@@ -921,6 +924,12 @@ def cmd_assign_worker(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> st
     provider = (a.provider or "").strip()
     full = f"{provider}/{model}" if provider and "/" not in model else model
     fam = normalize_family(full)
+    reviewer_fams = st.get("prereview_reviewer_families") or []
+    if st.get("gear") == 2 and reviewer_fams and not st.get("prereview_single_family") and fam in reviewer_fams:
+        raise FlowError(
+            f"HARD GATE: worker family {fam!r} collides with the Gear 2 pre-reviewer families "
+            f"({', '.join(reviewer_fams)}); pick a worker from a different family"
+        )
     sl["worker_model"] = full
     sl["worker_family"] = fam
     sl["worker_agent_id"] = a.agent_id
@@ -969,7 +978,7 @@ def cmd_enter_review(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str
     rev_fam = normalize_family(reviewer)
     verified = False
     if a.single_family_host:
-        verify_single_family_host(ctx)
+        verify_single_family_host(ctx, set(sl["author_families"]) | {rev_fam})
         verified = True
     if rev_fam in sl["author_families"] and not verified:
         raise FlowError(
@@ -1171,6 +1180,7 @@ def cmd_integrate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
             if res.returncode != 0:
                 _abort_and_restore(target, target_head, "merge")
                 sl["required_rebase_target"] = target_head
+                sl["rebase_target_path"] = str(target)
                 set_slice_state(sl, "NEEDS_REBASE", f"merge conflict onto {target_head[:12]}")
                 raise FlowError(
                     f"merge conflict: aborted cleanly; slice {sl['id']} -> NEEDS_REBASE onto {target_head}",
@@ -1187,6 +1197,7 @@ def cmd_integrate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
         if res.returncode != 0:
             _abort_and_restore(target, target_head, "cherry-pick")
             sl["required_rebase_target"] = target_head
+            sl["rebase_target_path"] = str(target)
             set_slice_state(sl, "NEEDS_REBASE", f"cherry-pick conflict onto {target_head[:12]}")
             raise FlowError(
                 f"cherry-pick conflict: aborted cleanly; slice {sl['id']} -> NEEDS_REBASE onto {target_head}",
@@ -1209,13 +1220,30 @@ def cmd_integrate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
     return f"slice {sl['id']} INTEGRATED via {how} (target HEAD {new_head[:12]}); task state {st['state']}"
 
 
+def current_rebase_target(st: Dict[str, Any], sl: Dict[str, Any]) -> str:
+    """Latest HEAD of the integration target the slice must sit on (read live, never a stale record)."""
+    path = sl.get("rebase_target_path") or st.get("integration_target") or st["repo_root"]
+    if path == st["repo_root"]:
+        return st["expected_main_head_sha"]
+    target = Path(path)
+    if not target.is_dir():
+        raise FlowError(f"integration worktree {target} is missing")
+    if not compute_repo_snapshot(target)["is_clean"]:
+        raise FlowError(f"integration worktree {target} is not clean")
+    head = git_out(target, "rev-parse", "HEAD")
+    expected = st.get("integration_head_sha") or st["expected_main_head_sha"]
+    if head != expected:
+        raise FlowError(f"integration worktree HEAD {head} drifted from the ledger ({expected})")
+    return head
+
+
 def cmd_mark_rebased(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
     sl = get_slice(st, validate_id(a.slice))
     if sl["state"] != "NEEDS_REBASE":
         raise FlowError(f"mark-rebased requires NEEDS_REBASE (slice is {sl['state']})")
     verify_main(st)
     wt = Path(sl["worktree"])
-    target = sl.get("required_rebase_target") or st["expected_main_head_sha"]
+    target = current_rebase_target(st, sl)
     res = git_raw(wt, "rev-parse", "--verify", f"{a.new_slice_base}^{{commit}}")
     if res.returncode != 0:
         raise FlowError(f"unknown commit {a.new_slice_base!r}")
@@ -1242,23 +1270,40 @@ def cmd_mark_rebased(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str
     return f"slice {sl['id']} rebased onto {new_base[:12]}; full cross-family review required again"
 
 
+def _verify_integration_integrity(st: Dict[str, Any], target: str, phase: str) -> None:
+    try:
+        verify_main(st)
+        if target != st["repo_root"]:
+            if not Path(target).is_dir():
+                raise FlowError(f"integration worktree {target} is missing")
+            if git_out(target, "rev-parse", "HEAD") != st.get("integration_head_sha"):
+                raise FlowError("integration worktree HEAD drifted from the recorded integration commit")
+            if not compute_repo_snapshot(target)["is_clean"]:
+                raise FlowError("integration worktree has uncommitted or untracked changes")
+    except FlowError as exc:
+        raise FlowError(f"verify-integration integrity check failed {phase}: {exc}")
+
+
 def cmd_verify_integration(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
     if st["state"] != "MERGED_PENDING_VERIFY":
         raise FlowError(f"verify-integration requires MERGED_PENDING_VERIFY (current {st['state']})")
     cmd = non_empty(a.cmd, "--cmd")
     target = st.get("integration_target") or st["repo_root"]
-    if target == st["repo_root"]:
-        verify_main(st)
-    elif git_out(target, "rev-parse", "HEAD") != st.get("integration_head_sha"):
-        raise FlowError("integration worktree HEAD drifted from the ledger")
+    _verify_integration_integrity(st, target, "before --cmd")
     res = subprocess.run(cmd, shell=True, cwd=target, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     output = decode(res.stdout)
     if output:
         print(output[-4000:], end="" if output.endswith("\n") else "\n")
-    st.setdefault("verifications", []).append({"cmd": cmd, "exit_code": res.returncode, "at": now_iso()})
+    record = {"cmd": cmd, "exit_code": res.returncode, "at": now_iso()}
+    st.setdefault("verifications", []).append(record)
     if res.returncode != 0:
         raise FlowError(f"verification command exited {res.returncode}; task stays MERGED_PENDING_VERIFY",
                         code=EXIT_VERIFY_FAILED, save=True)
+    try:
+        _verify_integration_integrity(st, target, "after --cmd")
+    except FlowError as exc:
+        record["integrity_failure"] = str(exc)
+        raise FlowError(f"{exc}; task stays MERGED_PENDING_VERIFY", code=EXIT_VERIFY_FAILED, save=True)
     cleaned = []
     for sl in st["slices"].values():
         if sl["state"] == "INTEGRATED" and not sl.get("cleaned_at"):
@@ -1283,9 +1328,7 @@ def cmd_decide_spike(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str
         raise FlowError(f"decide or discard other active slices first: {', '.join(others)}")
     new_slices: List[str] = []
     if a.decision == "go":
-        new_slices = [validate_id(s) for s in parse_csv(a.slices)]
-        if not new_slices:
-            raise FlowError("decision 'go' requires --slices <csv> naming the fresh production slices")
+        new_slices = [validate_id(s) for s in parse_csv(a.slices)] or [validate_id(f"{sl['id']}-prod")]
     cleanup_slice(ctx, st, sl)
     sl["spike_decision"] = {"decision": a.decision, "summary": summary, "at": now_iso()}
     set_slice_state(sl, "SPIKE_CLOSED", a.decision)
@@ -1294,7 +1337,7 @@ def cmd_decide_spike(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str
         st["gear"] = 2
         st["state"] = "ALIGNED"
         st["aligned_slices"] = new_slices
-        st.pop("prereview", None)
+        clear_prereview(st)
         bump_epoch(st)
     elif a.decision == "pivot":
         st["state"] = "PREMORTEM_DONE"
@@ -1414,7 +1457,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-dir", help="ledger directory")
     p.add_argument("--task-id", help="task id (ledger at ${PASEO_HOME:-~/.paseo}/runs/<task-id>)")
     p.add_argument("--paseo-home", help="Paseo home; passed as --home to every paseo CLI call")
-    p.add_argument("--online-models-json", help="offline list of online models (testing/air-gapped hosts)")
     sub = p.add_subparsers(dest="command")
     sub.required = True
 
@@ -1518,7 +1560,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--slice", required=True)
     s.add_argument("--decision", choices=("go", "pivot", "kill"), required=True)
     s.add_argument("--summary", required=True)
-    s.add_argument("--slices", help="fresh production slice ids (required for go)")
+    s.add_argument("--slices", help="fresh production slice ids for go (default: <slice>-prod)")
 
     s = sub.add_parser("discard-slice")
     s.add_argument("--slice", required=True)
@@ -1554,7 +1596,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         run_dir = resolve_run_dir(args)
-        ctx = Ctx(run_dir, args.paseo_home, args.online_models_json)
+        ctx = Ctx(run_dir, args.paseo_home)
         if args.command == "init":
             resolve_init_repo(run_dir, args.repo)  # validate before creating anything on disk
         with ledger_lock(run_dir):
@@ -1575,6 +1617,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(render_status(st), end="")
                 return 0
             try:
+                # Universal entry gate: every ledger-mutating command re-verifies the main repo snapshot
+                # (HEAD + tracked/staged/untracked content) before anything else, leaving the ledger untouched
+                # on mismatch.
+                verify_main(st)
                 msg = HANDLERS[args.command](ctx, st, args)
             except FlowError as exc:
                 if exc.save:
