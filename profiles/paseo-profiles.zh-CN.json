@@ -1,0 +1,71 @@
+{
+  "appendSystemPromptTemplate": "<!-- paseo-engineering:start -->\n处理缺陷修复、性能优化、架构重构、核心功能开发、新方向技术调研或用户要求多 Agent 协作时，先读取 {{SKILL_PATH}}：主会话专职担任总诊协调官（严禁直接写业务代码或手工解合并冲突），先经只读本质分流剥离表象与病根，再按 Gear 1/2/3 切分独立 Git worktree 派发 [Worker] 实现提交，并强制配对跨模型家族的 [Red-Team] / [Reviewer] 独立证伪与审查，闭环后无冲突串行合入。纯问答直接回答，纯机械改字直接执行。被委派的子 Agent（存在 PASEO_PARENT_AGENT_ID 或提示词限定为 [Triage]/[Explorer]/[Red-Team]/[Worker]/[Reviewer] 时）只执行本次单一受托职责，禁止再次启动顶层协调流。\n<!-- paseo-engineering:end -->",
+  "agentProfiles": [
+    {
+      "id": "paseo_eng_coordinator",
+      "name": "总诊·协调官",
+      "provider": "antigravity",
+      "model": "gemini-4-carbon-high",
+      "modeId": "full-access",
+      "notes": "主会话总控角色：快照主工作区、维护运行账本、切分独立 Git worktree、派发异构 Paseo 角色会话、无冲突串行合入已过审分支并重跑集成验证；严禁直接编写业务代码或手工解代码冲突。"
+    },
+    {
+      "id": "paseo_eng_triage",
+      "name": "[Triage] 本质分流官",
+      "provider": "antigravity",
+      "model": "gemini-4-carbon-high",
+      "modeId": "full-access",
+      "notes": "只读约束（提示词+快照双重校验）：顺因果链剥离症状点 X 与不变量首次破坏源头 Y，全仓普查同源漏点，拆分复合任务并产出《本质诊断与派单卡》。"
+    },
+    {
+      "id": "paseo_eng_explorer",
+      "name": "[Explorer] 正交探路员",
+      "provider": "antigravity",
+      "model": "gemini-4-carbon-high",
+      "modeId": "full-access",
+      "notes": "只读约束（提示词+快照双重校验）：Gear 2 沿局部渐进/结构重构/边界外移三范式并行发散方案；Gear 3 按外部技术横评×内部硬样本双线摸底，不修改代码。"
+    },
+    {
+      "id": "paseo_eng_redteam_claude",
+      "name": "[Red-Team] 异构红队官 (Claude)",
+      "provider": "antigravity",
+      "model": "claude-opus-5-5-high",
+      "modeId": "full-access",
+      "notes": "只读跨模型家族唱反调：对照最新源码/字节码查重、搜绕过漏口、算端到端上限（Gear 2）或对真实痛点样本做事前验尸（Gear 3）。"
+    },
+    {
+      "id": "paseo_eng_worker_claude",
+      "name": "[Worker] 隔离执行员 (Claude)",
+      "provider": "antigravity",
+      "model": "claude-opus-5-5-high",
+      "modeId": "full-access",
+      "notes": "物理绑定独立 Git worktree (--cwd) 与隔离包缓存：首步先动态实证根因假设（推翻则带数据退单重诊），再完成源头实现、反例测试（或轻量探针）并在隔离分支提交。"
+    },
+    {
+      "id": "paseo_eng_reviewer_gemini",
+      "name": "[Reviewer] 异构审查官 (Gemini)",
+      "provider": "antigravity",
+      "model": "gemini-4-neon-xhigh",
+      "modeId": "full-access",
+      "notes": "面向 Claude/Codex 执行员的跨模型只读审查官：直接审隔离分支已提交 git diff、反例单测、产物纯净度与探针/基准原始日志，BLOCKING 须附可构造反例。"
+    },
+    {
+      "id": "paseo_eng_worker_codex",
+      "name": "[Worker] 隔离执行员 (Codex)",
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "modeId": "full-access",
+      "thinkingOptionId": "high",
+      "notes": "物理绑定独立 Git worktree (--cwd) 与隔离包缓存：先验证根因假设，再执行源头修复与反例单测、完成分支提交并返回原始验证证据。"
+    },
+    {
+      "id": "paseo_eng_reviewer_codex",
+      "name": "[Reviewer] 异构审查官 (Codex)",
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "modeId": "auto-review",
+      "thinkingOptionId": "xhigh",
+      "notes": "只读约束（提示词+协调官双快照校验）跨模型红队与审查官：面向 Gemini/Claude 执行员执行代码证伪、双视角 diff 审查与原始数据审计。"
+    }
+  ]
+}

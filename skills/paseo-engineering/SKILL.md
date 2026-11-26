@@ -1,0 +1,71 @@
+---
+name: paseo-engineering
+description: >-
+  Universal root-cause triage and Paseo cross-model isolated multi-agent engineering workflow. Use for bug fixes, performance optimization, architectural refactoring, core feature work, or R&D exploration: the primary session acts strictly as Coordinator (never writing production code or resolving code conflicts by hand), runs read-only Essence Triage to separate symptoms from root causes, and orchestrates isolated Git worktree implementation with mandatory cross-model-family Red-Team falsification and code review before conflict-free serial integration.
+---
+
+# Paseo Cross-Model Root-Cause Triage & Isolated Engineering Workflow
+
+This workflow enforces **role separation + isolated Git worktree development + mandatory cross-model-family adversarial review** to eliminate symptom band-aids, single-model blind spots, and self-review rubber-stamping.
+
+## 1. Scope & Delegated Subagent Guard
+
+- **Pure Q&A / Status Inspection**: Answer directly. Do not create worktrees or spawn subagents.
+- **Trivial Mechanical Copy Edits** (literal typo fixes or constant renames with zero causal logic): Execute and verify directly in the primary session.
+- **Delegated Subagent Guard**: If running inside a child task (`PASEO_PARENT_AGENT_ID` is set, or the prompt scopes this turn to `[Triage]` / `[Explorer]` / `[Red-Team]` / `[Worker]` / `[Reviewer]`), **execute only that single role's mandate—never restart top-level coordination or spawn nested orchestration loops**.
+- **Paseo Transport Discovery**: Prefer injected Paseo MCP tools (consult the `paseo` skill for runtime schema when present); fall back to the local `paseo` CLI (`paseo --help`, `paseo run --help`). If `PASEO_AGENT_ID` is absent and the user wants Paseo-tracked sessions, launch the coordinator via Paseo rather than fabricating a parent ID.
+
+## 2. Six Specialized Roles & Cross-Model-Family Rule
+
+Except for trivial copy edits, **the primary session never acts as both judge and production code writer**. All engineering work coordinates six distinct roles:
+
+| Role Tag | Core Function | Workspace & Write Boundary | Deliverable | Model-Family Rule |
+| :--- | :--- | :--- | :--- | :--- |
+| **`Coordinator`**<br>(Primary Session) | Intent routing, run-ledger upkeep, main-checkout snapshotting, worktree lifecycle, spawning/collecting Paseo agents, conflict-free serial merge & final integration check | Read-only anchor + conflict-free merge; **never writes feature/fix code or hand-edits merge conflicts** | Dispatch briefs, merged code & final verification report | Primary session model |
+| **`[Triage]`**<br>Essence Diagnostician | Trace causal chain from symptom site `X` to root broken invariant `Y`; repo-wide sibling sweep; slice compound tasks | **Read-only bound** (no edits, no artifact-emitting builds in main checkout; verified against snapshot) | *Essence Triage & Dispatch Card* | Coordinator read-only when localized; dedicated scout subagent(s) when broad |
+| **`[Explorer]`**<br>Orthogonal Explorer | Gear 2: diverge across 3 orthogonal paradigms; Gear 3: parallel outward landscape × inward hard-sample recon | **Read-only bound** | Candidate designs or landscape matrix | When `N ≥ 2` model families are online, use at most `N-1` families (reserving ≥1 distinct family for Red-Team) |
+| **`[Red-Team]`**<br>Adversarial Skeptic | Falsify candidates against live source/bytecode (duplication check, unguarded bypasses, Amdahl ceiling) or run pre-mortem | **Read-only bound** | Concrete counterexamples & pruning verdict | **Must differ in model family from each candidate's authoring `[Explorer]`** |
+| **`[Worker]`**<br>Isolated Implementer | `1 Worker = 1 Branch = 1 Isolated Worktree`; verify root hypothesis dynamically first (re-triage on mismatch), build root fix + counterexample tests (or PoC), and commit cleanly on the branch | **Read/write strictly inside bound `--cwd` isolated worktree & isolated package cache**; never touch main checkout, global caches, or `git push` | Clean worktree commits, tests, raw logs | Strong coding / reasoning model |
+| **`[Reviewer]`**<br>Cross-Model Auditor | Dual-lens pre-review, isolated worktree `git diff` post-review (Gear 1/2), raw PoC/benchmark data audit (Gear 2/3); `BLOCKING` requires a constructible counterexample | **Read-only bound** (inspects raw worktree files, diffs & logs directly—never summaries; worktree `HEAD` verified unchanged after review) | Graded verdict (`PASS` / `BLOCKING`) | **Must differ in model family from the corresponding `[Worker]`** |
+
+- **Cross-Model-Family Enforcement**: Query live models first via Paseo MCP or `paseo provider ls` / `paseo provider models <provider>` to determine the count `N` of online model families (e.g., `OpenAI Codex/GPT`, `Anthropic Claude`, `Google Gemini`). **Every adversarial pair (candidate author `Explorer ↔ Red-Team`, `Worker ↔ Reviewer`) must belong to different model families** (intra-family tiers such as `Opus` reviewing `Sonnet` do **not** count as heterogeneous; fall back only if `N = 1` on the host and state that limitation explicitly). Prefer native OS read-only sandboxes when offered by a provider; otherwise enforce read-only via role prompts plus Coordinator pre/post snapshot checks on both the main checkout and target worktree `HEAD`.
+
+## 3. Stage 00 · Mandatory Read-Only Essence Triage & Three-Gear Routing
+
+Never classify task size by expected diff lines. Produce an **Essence Triage & Dispatch Card** before any production code edit:
+
+1. **Separate Symptom from Root Origin**: Pinpoint symptom site `X` vs. root invariant violation `Y`, setting the hard rule: **"Do not apply null short-circuits, exception swallowing, or symptom band-aids at `X`; fix at root origin `Y`."**
+2. **Sibling Sweep & Compound Slicing**: Sweep the repo for sibling occurrences of the same root pattern; split hybrid requests into orthogonal slices with independent gears and dependencies.
+3. **Route by Problem Essence** (attaching domain hard-constraint lenses as applicable: performance → [references/lens-performance.md](references/lens-performance.md); bugs/FN/FP/precision → [references/lens-bug-precision.md](references/lens-bug-precision.md); refactoring/architecture → [references/lens-refactor-arch.md](references/lens-refactor-arch.md)):
+   - **Gear 1 · Fast Root Fix (Essence A: single unambiguous root omission, zero architectural ambiguity)** → **0 human stops**; execute straight through Section 4's isolated two-agent loop (`1 Isolated [Worker] + 1 Cross-Model [Reviewer]`, skipping multi-path ideation and pre-review). If build/test or cross-model review fails for **2 rounds** or hidden cross-layer coupling surfaces, **always auto-escalate to Gear 2** (never merge with an open `BLOCKING` or stall in Gear 1).
+   - **Gear 2 · Deep Solve (Essence B: multi-path trade-offs, cross-module/upstream library changes, strict performance/precision gates)** → Read [references/mode-deep-solve.md](references/mode-deep-solve.md) (`[Explorer]` 3-paradigm ideation → `[Red-Team]` falsification → **1 human alignment stop** → dual pre-review → parallel isolated `[Worker]`s → dual cross-model `[Reviewer]`s & data audit).
+   - **Gear 3 · Explore & Spike (Essence C: uncharted capability, `0 → 1` unproven direction)** → Read [references/mode-explore-spike.md](references/mode-explore-spike.md) (outward × inward `[Explorer]`s → `[Red-Team]` pre-mortem → **Stop 1: Spike Contract** → isolated `[Worker]` throwaway PoC + mandatory cross-model `[Reviewer-Audit]` of raw PoC data → **Stop 2: Go / Pivot / Kill**; discard raw spike and transition into Gear 2 Part 2 upon **Go**).
+
+## 4. Five-Step Isolated Worktree & Cross-Model Review Lifecycle
+
+Gear 1 and Gear 2 production changes execute all five steps below (Gear 3 spikes reuse Steps 1–3 for isolated experimentation and replace production code-style review with mandatory cross-model raw-data audit):
+
+1. **Snapshot Main Checkout & Cut Isolated Worktrees (Snapshot & Isolate)**
+   - Record `BASE_SHA` and capture `MAIN_DIFF_HASH` of working-tree changes in the main checkout (`git status --porcelain` plus patch content hash of uncommitted edits, independent of `HEAD` so serial merges do not invalidate it), leaving pre-existing user changes untouched.
+   - Cut a dedicated branch and worktree per write slice: `git worktree add -b <slice-branch> <isolated-worktree-path> <BASE_SHA>`, setting `SLICE_BASE = BASE_SHA`. If the task explicitly depends on uncommitted main-checkout edits, commit that patch first as a standalone baseline commit in `<wt>` and set `SLICE_BASE` to that commit (so review diffs isolate `[Worker]`'s own changes, and ask the user before touching dirty main-checkout files at merge time—never silently commit user changes). Whenever any command writes package caches (`mvn install`, `pip install`, or upstream library builds), configure an isolated local cache (`-Dmaven.repo.local`, dedicated virtualenv, etc.) so shared global caches stay untouched.
+2. **Spawn Explicit Paseo Role Sessions (Dispatch)**
+   - Launch each role via Paseo MCP or CLI (`paseo run --no-wait -q --provider <p> --model <m> --cwd <abs-worktree-path> --title "[Worker] <slice>"`), binding `--cwd` at process creation so every role's session, model, and timeline are visible in Paseo (on Windows, explicitly `Set-Location -LiteralPath '<worktree>'` per shell call; across hosts, verify reachable workspaces/models and track `{serverId, agentId, workspaceId, cwd}`).
+   - Include in every brief: acceptance criteria, the *Essence Triage & Dispatch Card* (root `Y` + anti-band-aid rule), active `lens-*.md` paths, editable file scope, and verification commands.
+3. **Verify Hypothesis → Implement at Root → Counterexamples → Commit (Implement & Commit)**
+   - **`[Worker]` Right to Challenge**: First verify the dispatch card's causal chain with a minimal test or probe; if dynamic evidence refutes the static diagnosis or changing `Y` breaks caller contracts, **stop immediately and return empirical evidence to re-triage** rather than forcing broken edits.
+   - Implement the root fix, sibling fixes, and automated counterexample/regression tests inside the isolated worktree, and create clean local Git commit(s) on the slice branch with zero untracked build residue.
+4. **Commit-Completeness Gate & Cross-Model Raw-Diff Audit (Cross-Model Review)**
+   - **Coordinator Pre/Post Snapshot Check**: Before launching `[Reviewer]`, verify: (1) main checkout uncommitted state matches `MAIN_DIFF_HASH`; (2) `git -C <wt> status --porcelain` is empty; and (3) `git -C <wt> rev-list --count <SLICE_BASE>..HEAD` > `0`, recording `WT_HEAD_SHA`. After `[Reviewer]` finishes, re-verify `git -C <wt> rev-parse HEAD == WT_HEAD_SHA` and clean status so an unsandboxed reviewer could not mutate `<wt>`.
+   - Launch a **cross-model-family read-only `[Reviewer]`**, passing only the isolated worktree path, `git diff <SLICE_BASE>...HEAD`, raw test log paths, and **neutral review questions** (never biased summaries).
+   - **Closure & 2-Round Cap**: `BLOCKING` requires a concrete constructible counterexample or contract violation (`OPTIONAL` otherwise). Route valid `BLOCKING` defects back to the isolated `[Worker]` to commit fixes, then have the **same cross-model `[Reviewer]` audit both the incremental fix and the full `git diff <SLICE_BASE>...HEAD`** until `0 BLOCKING`:
+     - **Gear 1** hitting **2 unresolved rounds**: always auto-escalate to **Gear 2**;
+     - **Gear 2** hitting **2 unresolved rounds**: downgrade to `OPTIONAL` **only if the Reviewer failed to supply a constructible counterexample/contract violation** (logging refutation evidence in `status.md`), escalate genuine architectural trade-offs to the user, or **re-triage / discard the candidate slice** if real defects remain unfixed—**never merge while a valid `BLOCKING` counterexample remains open**.
+5. **Conflict-Free Serial Integration, Re-Verification & Cleanup (Integrate or Discard)**
+   - **Coordinator never hand-edits merge conflicts**: Merge `<SLICE_BASE>..HEAD` serially only after **tests pass + cross-model review hits `0 BLOCKING` + active lens gates pass**. If a later slice conflicts with an earlier merged slice (moving target to `NEW_TARGET_SHA`), the Coordinator must **not** resolve code conflicts manually—instead, send the later slice's `[Worker]` to `rebase` onto `NEW_TARGET_SHA` (updating its `SLICE_BASE = NEW_TARGET_SHA`), resolve conflicts + re-run tests in its worktree, and pass cross-model `[Reviewer]` re-audit on the new `git diff <SLICE_BASE>...HEAD` before clean integration (if dirty user files in the main checkout block checkout merge, ask the user first or deliver the verified branch in a clean integration worktree—never silently commit user edits).
+   - Re-run integration verification on the final merged tree and remove temporary worktrees; if empirical targets fail or a spike is killed, archive evidence/reviews first and delete the isolated worktree/branch cleanly.
+
+## 5. Resilience, Load Mutual Exclusion & Safety Boundaries
+
+- **Heavy-Load Mutual Exclusion**: Reading code, static reviews, and isolated worktree coding may run in parallel (2–3 active subagents typical); **full test suites, heavy builds, and benchmarks must check host load and run serially or core-pinned**.
+- **On-Disk Run Ledger & Quota Failover**: Persist `$PASEO_HOME/runs/<task-id>/status.md` (default `~/.paseo/runs/<task-id>/status.md`) on entering Gear 2/3 with the dispatch card, Paseo agent IDs/models, worktree map, passed gates, and evidence paths. Read the ledger first on restart; await completion notifications (`paseo wait` / MCP wakeup) rather than tight polling; fail over immediately to an alternate model family upon quota exhaustion or heartbeat timeout.
+- **External Side-Effect Gate & Pitfall Distillation**: Subagents must never run `git push`, create/edit PRs/MRs/issues, delete external branches, deploy, or message externally (reserved for the Coordinator under explicit current-session authorization). Suggest a one-line `AGENTS.md` pitfall entry only when a counterintuitive repo-wide trap was uncovered, and report root cause, branches/worktrees, participating Paseo role agents/models, executed tests, and unexecuted checks honestly.

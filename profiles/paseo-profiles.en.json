@@ -1,0 +1,71 @@
+{
+  "appendSystemPromptTemplate": "<!-- paseo-engineering:start -->\nWhen handling bug fixes, performance optimization, architectural refactoring, core feature work, R&D investigation, or multi-agent requests, read {{SKILL_PATH}} first: the primary session acts strictly as Coordinator (never writing production feature/fix code or resolving code conflicts manually), runs read-only Essence Triage to separate symptoms from root causes, and orchestrates isolated Git worktree [Worker] sessions paired with cross-model-family [Red-Team] / [Reviewer] sessions across Gear 1/2/3 before conflict-free serial integration. Answer pure Q&A directly and execute trivial copy edits without ceremony. Delegated subagents (when PASEO_PARENT_AGENT_ID is set or scoped to [Triage]/[Explorer]/[Red-Team]/[Worker]/[Reviewer]) must execute only their single assigned role and never restart top-level coordination.\n<!-- paseo-engineering:end -->",
+  "agentProfiles": [
+    {
+      "id": "paseo_eng_coordinator",
+      "name": "Coordinator",
+      "provider": "antigravity",
+      "model": "gemini-4-carbon-high",
+      "modeId": "full-access",
+      "notes": "Primary orchestrator: snapshots main checkout, maintains run ledger, cuts isolated Git worktrees, dispatches heterogeneous Paseo role agents, and merges verified branches conflict-free without writing feature/fix code directly."
+    },
+    {
+      "id": "paseo_eng_triage",
+      "name": "[Triage] Essence Diagnostician",
+      "provider": "antigravity",
+      "model": "gemini-4-carbon-high",
+      "modeId": "full-access",
+      "notes": "Read-only bound (prompt + snapshot verified): traces causal chains from symptom site X to root invariant violation Y, sweeps for sibling defects, slices compound tasks, and emits the Essence Triage & Dispatch Card."
+    },
+    {
+      "id": "paseo_eng_explorer",
+      "name": "[Explorer] Orthogonal Explorer",
+      "provider": "antigravity",
+      "model": "gemini-4-carbon-high",
+      "modeId": "full-access",
+      "notes": "Read-only bound (prompt + snapshot verified): explores 3 orthogonal paradigms (Gear 2) or outward landscape vs. inward hard samples (Gear 3) without editing code or spawning subagents."
+    },
+    {
+      "id": "paseo_eng_redteam_claude",
+      "name": "[Red-Team] Skeptic (Claude)",
+      "provider": "antigravity",
+      "model": "claude-opus-5-5-high",
+      "modeId": "full-access",
+      "notes": "Read-only cross-model-family skeptic: falsifies candidate designs against live source/bytecode (Gear 2) or runs pre-mortems on real hard samples (Gear 3)."
+    },
+    {
+      "id": "paseo_eng_worker_claude",
+      "name": "[Worker] Isolated Implementer (Claude)",
+      "provider": "antigravity",
+      "model": "claude-opus-5-5-high",
+      "modeId": "full-access",
+      "notes": "Bound to a dedicated Git worktree (--cwd) & isolated package cache: verifies root hypothesis dynamically first (re-triages on mismatch), then commits root fixes + counterexample tests or throwaway PoC spikes."
+    },
+    {
+      "id": "paseo_eng_reviewer_gemini",
+      "name": "[Reviewer] Cross-Model Auditor (Gemini)",
+      "provider": "antigravity",
+      "model": "gemini-4-neon-xhigh",
+      "modeId": "full-access",
+      "notes": "Read-only cross-model auditor for Claude/Codex workers: audits committed worktree git diffs, counterexample tests, artifact purity, and raw PoC/benchmark logs. BLOCKING requires a constructible counterexample."
+    },
+    {
+      "id": "paseo_eng_worker_codex",
+      "name": "[Worker] Isolated Implementer (Codex)",
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "modeId": "full-access",
+      "thinkingOptionId": "high",
+      "notes": "Bound to a dedicated Git worktree (--cwd) & isolated package cache: verifies root-cause assumptions first, commits root fixes and counterexample tests, and returns raw verification logs."
+    },
+    {
+      "id": "paseo_eng_reviewer_codex",
+      "name": "[Reviewer] Cross-Model Auditor (Codex)",
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "modeId": "auto-review",
+      "thinkingOptionId": "xhigh",
+      "notes": "Read-only bound (prompt + Coordinator main/worktree snapshot verified) cross-model skeptic/auditor for Gemini/Claude workers: performs Red-Team falsification, dual-lens diff review, and raw data audits."
+    }
+  ]
+}
