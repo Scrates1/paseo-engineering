@@ -354,19 +354,25 @@ def online_model_specs(ctx: Ctx) -> List[str]:
     specs: List[str] = []
     for item in providers:
         if not isinstance(item, dict):
-            continue
-        name = str(item.get("provider") or item.get("id") or "").strip()
+            raise FlowError(f"malformed provider entry in 'paseo provider ls --json': {item!r}")
+        raw_name = item.get("provider", item.get("id"))
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise FlowError(f"provider entry without a valid string identifier: {item!r}")
+        name = raw_name.strip()
         status = str(item.get("status", "")).lower()
         enabled = str(item.get("enabled", "enabled")).lower()
-        if not name or status != "available" or enabled in ("disabled", "false"):
+        if status != "available" or enabled in ("disabled", "false"):
             continue
         models = parse_json_output(run_paseo(ctx, ["provider", "models", name, "--json"]))
-        if not isinstance(models, list):
-            raise FlowError(f"unexpected 'paseo provider models {name} --json' payload: {models!r}")
+        if not isinstance(models, list) or not models:
+            raise FlowError(f"online provider {name!r} returned no usable model list: {models!r}")
         for m in models:
-            mid = (m.get("id") or m.get("model")) if isinstance(m, dict) else m
-            if mid:
-                specs.append(f"{name}/{mid}")
+            if not isinstance(m, dict) or "error" in m:
+                raise FlowError(f"online provider {name!r} returned a malformed model entry: {m!r}")
+            mid = m.get("id", m.get("model"))
+            if not isinstance(mid, str) or not mid.strip():
+                raise FlowError(f"online provider {name!r} returned a model entry without an id: {m!r}")
+            specs.append(f"{name}/{mid.strip()}")
     return specs
 
 
@@ -925,11 +931,14 @@ def cmd_assign_worker(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> st
     full = f"{provider}/{model}" if provider and "/" not in model else model
     fam = normalize_family(full)
     reviewer_fams = st.get("prereview_reviewer_families") or []
-    if st.get("gear") == 2 and reviewer_fams and not st.get("prereview_single_family") and fam in reviewer_fams:
-        raise FlowError(
-            f"HARD GATE: worker family {fam!r} collides with the Gear 2 pre-reviewer families "
-            f"({', '.join(reviewer_fams)}); pick a worker from a different family"
-        )
+    if st.get("gear") == 2 and reviewer_fams and fam in reviewer_fams:
+        if not st.get("prereview_single_family"):
+            raise FlowError(
+                f"HARD GATE: worker family {fam!r} collides with the Gear 2 pre-reviewer families "
+                f"({', '.join(reviewer_fams)}); pick a worker from a different family"
+            )
+        # The pre-review exemption is a cached fact; re-probe live before trusting it again.
+        verify_single_family_host(ctx, {fam})
     sl["worker_model"] = full
     sl["worker_family"] = fam
     sl["worker_agent_id"] = a.agent_id
@@ -1315,6 +1324,21 @@ def cmd_verify_integration(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) 
     return f"verification passed; cleaned {', '.join(cleaned) or 'nothing'}; task COMPLETED{tail}"
 
 
+def default_prod_slice_id(st: Dict[str, Any], spike_id: str) -> str:
+    """Deterministic, <= 64-char, collision-free default production slice id for a 'go' spike."""
+    taken = set(st.get("slices", {})) | {s.get("id") for s in st.get("slice_archive", [])}
+    plain = f"{spike_id}-prod"
+    if len(plain) <= 64 and plain not in taken:
+        return validate_id(plain)
+    stem = spike_id[:51].rstrip("-_.") or "slice"
+    for salt in range(1000):
+        seed = spike_id if salt == 0 else f"{spike_id}#{salt}"
+        cand = f"{stem}-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:6]}-prod"
+        if cand not in taken:
+            return validate_id(cand)
+    raise FlowError(f"could not derive a free default production slice id for {spike_id!r}; pass --slices")
+
+
 def cmd_decide_spike(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
     sl = get_slice(st, validate_id(a.slice))
     if sl["kind"] != "spike" or sl["state"] != "SPIKE_AUDITED":
@@ -1328,7 +1352,7 @@ def cmd_decide_spike(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str
         raise FlowError(f"decide or discard other active slices first: {', '.join(others)}")
     new_slices: List[str] = []
     if a.decision == "go":
-        new_slices = [validate_id(s) for s in parse_csv(a.slices)] or [validate_id(f"{sl['id']}-prod")]
+        new_slices = [validate_id(s) for s in parse_csv(a.slices)] or [default_prod_slice_id(st, sl["id"])]
     cleanup_slice(ctx, st, sl)
     sl["spike_decision"] = {"decision": a.decision, "summary": summary, "at": now_iso()}
     set_slice_state(sl, "SPIKE_CLOSED", a.decision)

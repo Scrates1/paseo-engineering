@@ -96,9 +96,12 @@ if argv[:2] == ["workspace", "archive"]:
     out({"workspaceId": argv[2], "archived": True})
 providers = json.loads(os.environ.get("MOCK_PASEO_PROVIDERS", "{}"))
 if argv[:2] == ["provider", "ls"]:
+    if "MOCK_PASEO_PROVIDER_LS" in os.environ:
+        print(os.environ["MOCK_PASEO_PROVIDER_LS"])
+        sys.exit(0)
     out([{"provider": p, "status": "available", "enabled": "Enabled"} for p in providers])
 if argv[:2] == ["provider", "models"]:
-    out([{"id": m, "model": m} for m in providers.get(argv[2], [])])
+    out([m if isinstance(m, dict) else {"id": m, "model": m} for m in providers.get(argv[2], [])])
 sys.stderr.write("unsupported mock call: %r\n" % (argv,))
 sys.exit(2)
 '''
@@ -497,7 +500,7 @@ class PaseoBackendTest(FlowTestBase):
         os.environ["MOCK_PASEO_PROVIDERS"] = "{}"
         self.reject(*args, contains="0 online model families")
         os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": []})
-        self.reject(*args, contains="0 online model families")
+        self.reject(*args, contains="no usable model list")
         os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"codex": ["gpt-6.1-sol"]})
         self.reject(*args, contains="not the sole online family")
         os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"]})
@@ -506,6 +509,38 @@ class PaseoBackendTest(FlowTestBase):
         os.environ["MOCK_PASEO_MODE"] = "daemon-down"
         self.reject(*args, contains="cannot verify")
         self.assertEqual(self.slice("main-fix")["state"], "IMPLEMENTING")
+
+    def test_single_family_host_rejects_any_broken_online_provider(self) -> None:
+        self.gear1_ready()
+        self.implement("main-fix", "fix/answer", worker=REVIEWER)
+        args = ("enter-review", "--slice", "main-fix", "--reviewer-model", "codex/gpt-6.2-astra", "--single-family-host")
+        broken = [
+            ({"codex": ["gpt-6.1-sol"], "antigravity": [{"error": "model listing failed"}]}, "malformed model entry"),
+            ({"codex": ["gpt-6.1-sol"], "antigravity": []}, "no usable model list"),
+            ({"codex": ["gpt-6.1-sol"], "antigravity": [{"id": "", "model": ""}]}, "without an id"),
+            ({"codex": ["gpt-6.1-sol"], "antigravity": [{"id": "gemini-4-neon-high", "error": "quota"}]},
+             "malformed model entry"),
+            ({"codex": ["gpt-6.1-sol"], "antigravity": [{"id": 7}]}, "without an id"),
+        ]
+        for providers, needle in broken:
+            with self.subTest(providers=providers):
+                os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps(providers)
+                self.reject(*args, contains=needle)
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"codex": ["gpt-6.1-sol"]})
+        for listing, needle in (
+            ('[{"provider": "codex", "status": "available"}, "junk"]', "malformed provider entry"),
+            ('[{"provider": "codex", "status": "available"}, {"status": "available"}]', "valid string identifier"),
+            ('[{"provider": "codex", "status": "available"}, {"provider": 5, "status": "offline"}]',
+             "valid string identifier"),
+        ):
+            with self.subTest(listing=listing):
+                os.environ["MOCK_PASEO_PROVIDER_LS"] = listing
+                self.reject(*args, contains=needle)
+        del os.environ["MOCK_PASEO_PROVIDER_LS"]
+        self.assertEqual(self.slice("main-fix")["state"], "IMPLEMENTING")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"codex": ["gpt-6.1-sol", "gpt-6.2-astra"]})
+        self.flow(*args)
+        self.assertEqual(self.slice("main-fix")["state"], "IN_REVIEW")
 
 
 class GearTwoFlowTest(FlowTestBase):
@@ -697,23 +732,55 @@ class GearTwoFlowTest(FlowTestBase):
 
 
 class GearThreeFlowTest(FlowTestBase):
-    def spike_audited(self, tag):
+    def spike_audited(self, tag, sid="s1", extra=()):
         self.run_dir = self.tmp / f"run-{tag}"
         self.flow("init", "--repo", str(self.repo))
         self.flow("triage", "--symptom", "unknown perf ceiling", "--root", "unknown", "--gear", "3")
         self.flow("record-explore", "--author-models", WORKER, "--summary", "recon")
         self.flow("record-redteam", "--model", REVIEWER_B, "--summary", "premortem")
-        self.reject("align", "--slices", "s1")
-        self.flow("align", "--slices", "s1", "--spike-hypothesis", "cache helps", "--spike-samples", "3 runs",
-                  "--go-criteria", ">20% faster")
-        self.reject("isolate", "--slice", "s1", "--branch", f"spike/{tag}", "--kind", "production")
-        self.flow("isolate", "--slice", "s1", "--branch", f"spike/{tag}", "--kind", "spike")
-        self.flow("assign-worker", "--slice", "s1", "--model", WORKER)
-        self.commit(self.wt("s1"), "bench.txt", "numbers\n")
-        self.flow("enter-review", "--slice", "s1", "--reviewer-model", REVIEWER_B, "--lens", "audit")
-        self.flow("record-review", "--slice", "s1", "--verdict", "PASS", "--blockers", "0", "--lens", "audit")
-        self.assertEqual(self.slice("s1")["state"], "SPIKE_AUDITED")
-        self.reject("integrate", "--slice", "s1", contains="never be merged")
+        self.reject("align", "--slices", sid)
+        self.flow("align", "--slices", ",".join((sid,) + tuple(extra)), "--spike-hypothesis", "cache helps",
+                  "--spike-samples", "3 runs", "--go-criteria", ">20% faster")
+        for idx, other in enumerate(extra):
+            self.flow("isolate", "--slice", other, "--branch", f"spike/{tag}-x{idx}", "--kind", "spike")
+            self.flow("discard-slice", "--slice", other, "--reason", "occupies the default name")
+        self.reject("isolate", "--slice", sid, "--branch", f"spike/{tag}", "--kind", "production")
+        self.flow("isolate", "--slice", sid, "--branch", f"spike/{tag}", "--kind", "spike")
+        self.flow("assign-worker", "--slice", sid, "--model", WORKER)
+        self.commit(self.wt(sid), "bench.txt", "numbers\n")
+        self.flow("enter-review", "--slice", sid, "--reviewer-model", REVIEWER_B, "--lens", "audit")
+        self.flow("record-review", "--slice", sid, "--verdict", "PASS", "--blockers", "0", "--lens", "audit")
+        self.assertEqual(self.slice(sid)["state"], "SPIKE_AUDITED")
+        self.reject("integrate", "--slice", sid, contains="never be merged")
+
+    def test_spike_go_default_id_for_long_and_colliding_spike_ids(self) -> None:
+        cases = [
+            ("len59", "a" * 59, None),
+            ("len60", "b" * 60, None),
+            ("len64", "c" * 63 + "-", None),
+            ("len64x", "d-" * 32, None),
+            ("collide", "short", ("short-prod",)),
+        ]
+        for tag, sid, extra in cases:
+            with self.subTest(tag=tag):
+                self.spike_audited(tag, sid=sid, extra=extra or ())
+                self.flow("decide-spike", "--slice", sid, "--decision", "go", "--summary", "win")
+                st = self.state()
+                prod = st["aligned_slices"]
+                self.assertEqual((st["gear"], st["state"], len(prod)), (2, "ALIGNED", 1))
+                self.assertLessEqual(len(prod[0]), 64)
+                self.assertEqual(flow.validate_id(prod[0]), prod[0])
+                self.assertNotIn(prod[0], st["slices"])
+                self.assertTrue(prod[0].endswith("-prod"))
+                if tag == "len59":
+                    self.assertEqual(prod[0], sid + "-prod")
+                else:
+                    self.assertNotEqual(prod[0], sid + "-prod")
+                    self.assertRegex(prod[0], r"-[0-9a-f]{6}-prod$")
+                self.assertEqual(flow.default_prod_slice_id(st, sid), prod[0])
+                self.flow("record-prereview", "--reviewer-a-model", REVIEWER, "--reviewer-b-model", REVIEWER_B,
+                          "--planned-worker-models", WORKER, "--blockers", "0")
+                self.flow("isolate", "--slice", prod[0], "--branch", f"feat/{tag}")
 
     def test_spike_go(self) -> None:
         self.spike_audited("go")
@@ -810,7 +877,25 @@ class PostReviewHardeningTest(FlowTestBase):
         st = self.state()
         self.assertEqual((st["prereview_reviewer_families"], st["prereview_single_family"]), (["anthropic"], True))
         self.flow("isolate", "--slice", "a", "--branch", "feat/a")
+
+        def probes():
+            return sum(1 for c in self.calls() if c["argv"][:2] == ["provider", "ls"])
+
+        # Codex comes back online after the pre-review: the cached exemption must be re-probed and refused.
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"], "codex": ["gpt-6.1-sol"]})
+        n = probes()
+        self.reject("assign-worker", "--slice", "a", "--model", WORKER, contains="REJECTED")
+        self.assertEqual(probes(), n + 1)
+        self.assertEqual((self.slice("a")["state"], self.slice("a")["worker_model"]), ("ISOLATED", None))
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"], "antigravity": [{"error": "down"}]})
+        self.reject("assign-worker", "--slice", "a", "--model", WORKER, contains="REJECTED")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus", "sonnet"]})
         self.flow("assign-worker", "--slice", "a", "--model", WORKER)
+        self.assertEqual(probes(), n + 3)
+        # Mid-flight relay to another same-family worker is re-probed as well.
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"claude": ["opus"], "codex": ["gpt-6.1-sol"]})
+        self.reject("assign-worker", "--slice", "a", "--model", "claude/sonnet", contains="REJECTED")
+        self.assertEqual(self.slice("a")["worker_model"], WORKER)
 
     def _dirty_main_integrated_into_worktree(self):
         (self.repo / "README.md").write_text("user wip\n")
