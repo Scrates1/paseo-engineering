@@ -23,6 +23,21 @@ BLOCK_RE = re.compile(
 )
 
 
+IGNORE_BUILD_ARTIFACTS = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+
+
+def make_scripts_executable(dst: Path) -> None:
+    """Ensure installed helper scripts (scripts/*.py) are executable on POSIX hosts."""
+    if os.name == "nt":
+        return
+    scripts_dir = dst / "scripts"
+    if not scripts_dir.is_dir():
+        return
+    for script in scripts_dir.glob("*.py"):
+        if script.is_file() and not script.is_symlink():
+            script.chmod(0o755)
+
+
 def copy_skill_tree(src: Path, dst: Path, dry_run: bool) -> None:
     if src.resolve() == dst.resolve():
         print(f"Skill already at canonical path {dst}; skipping self-copy.")
@@ -35,7 +50,8 @@ def copy_skill_tree(src: Path, dst: Path, dry_run: bool) -> None:
     elif dst.is_dir():
         shutil.rmtree(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst)
+    shutil.copytree(src, dst, ignore=IGNORE_BUILD_ARTIFACTS)
+    make_scripts_executable(dst)
     print(f"Installed skill files to {dst}")
 
 
@@ -62,7 +78,8 @@ def link_or_copy(src: Path, dst: Path, copy_mode: bool, dry_run: bool) -> None:
             return
         except OSError:
             pass
-    shutil.copytree(src, dst)
+    shutil.copytree(src, dst, ignore=IGNORE_BUILD_ARTIFACTS)
+    make_scripts_executable(dst)
     print(f"Copied {dst} <- {src}")
 
 

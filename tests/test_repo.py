@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 import tempfile
 import unittest
@@ -99,6 +101,41 @@ class RepoValidationTest(unittest.TestCase):
             violations = scan_text_violations(path.read_text(encoding="utf-8"))
             self.assertEqual(violations, [], f"Privacy violation {violations} in {path.relative_to(REPO_ROOT)}")
 
+    def test_scripts_byte_parity_between_en_and_zh(self) -> None:
+        en_dir = REPO_ROOT / "skills" / "paseo-engineering" / "scripts"
+        zh_dir = REPO_ROOT / "skills" / "zh-CN" / "paseo-engineering" / "scripts"
+        en_scripts = {p.name for p in en_dir.glob("*.py")}
+        zh_scripts = {p.name for p in zh_dir.glob("*.py")}
+        self.assertIn("flow.py", en_scripts)
+        self.assertEqual(en_scripts, zh_scripts)
+        for name in sorted(en_scripts):
+            self.assertEqual((en_dir / name).read_bytes(), (zh_dir / name).read_bytes(), f"scripts/{name} differs")
+            if os.name != "nt":
+                self.assertTrue(os.access(str(en_dir / name), os.X_OK), f"skills/.../scripts/{name} not executable")
+                self.assertTrue(os.access(str(zh_dir / name), os.X_OK), f"zh-CN scripts/{name} not executable")
+
+    def test_copy_skill_tree_ignores_bytecode_and_marks_scripts_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            (src / "scripts" / "__pycache__").mkdir(parents=True)
+            (src / "SKILL.md").write_text("x\n", encoding="utf-8")
+            (src / "scripts" / "flow.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            (src / "scripts" / "flow.py").chmod(0o644)
+            (src / "scripts" / "__pycache__" / "flow.cpython-38.pyc").write_bytes(b"\0")
+            (src / "scripts" / "stale.pyc").write_bytes(b"\0")
+            (src / "scripts" / "stale.pyo").write_bytes(b"\0")
+            for idx, copier in enumerate((
+                lambda d: install.copy_skill_tree(src, d, False),
+                lambda d: install.link_or_copy(src, d, True, False),
+            )):
+                dst = Path(tmp) / f"dst{idx}" / "paseo-engineering"
+                copier(dst)
+                self.assertTrue((dst / "scripts" / "flow.py").is_file())
+                self.assertFalse(list(dst.rglob("__pycache__")))
+                self.assertFalse(list(dst.rglob("*.pyc")) + list(dst.rglob("*.pyo")))
+                if os.name != "nt":
+                    self.assertEqual(stat.S_IMODE((dst / "scripts" / "flow.py").stat().st_mode), 0o755)
+
     def test_installer_in_isolated_temp_home_and_preserves_existing_config(self) -> None:
         for lang in ("en", "zh-CN"):
             with tempfile.TemporaryDirectory() as tmp:
@@ -127,6 +164,11 @@ class RepoValidationTest(unittest.TestCase):
 
                 canonical = paseo_dir / "skills" / "paseo-engineering" / "SKILL.md"
                 self.assertTrue(canonical.is_file())
+                installed_flow = canonical.parent / "scripts" / "flow.py"
+                self.assertTrue(installed_flow.is_file())
+                self.assertFalse(list(canonical.parent.rglob("__pycache__")))
+                if os.name != "nt":
+                    self.assertEqual(stat.S_IMODE(installed_flow.stat().st_mode), 0o755)
                 for rel in [
                     ".gemini/config/skills/paseo-engineering/SKILL.md",
                     ".codex/skills/paseo-engineering/SKILL.md",
