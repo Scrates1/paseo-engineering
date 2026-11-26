@@ -75,16 +75,19 @@ def out(obj):
 
 if argv[:2] == ["project", "create"]:
     out({"projectId": "prj_mock", "path": argv[-1]})
+bg_path = root / "background.json"
+bg_ids = json.loads(bg_path.read_text()) if bg_path.exists() else []
 if argv[:2] == ["workspace", "ls"]:
-    items = [{"workspaceId": k, "cwd": v} for k, v in db.items()]
+    want_bg = "--background" in argv
+    items = [{"workspaceId": k, "cwd": v} for k, v in db.items() if (k in bg_ids) == want_bg]
     out({"workspaces": items} if os.environ.get("MOCK_PASEO_WS_WRAP") else items)
 if argv[:2] == ["workspace", "create"]:
     repo, branch, base = opt("--path"), opt("--new-branch"), opt("--base")
-    if mode == "existing-cwd":
+    if mode in ("existing-cwd", "no-cwd-existing"):
         ws_id = "wks_%d" % (len(db) + 1)
         db[ws_id] = os.environ["MOCK_PASEO_EXISTING_CWD"]
         db_path.write_text(json.dumps(db))
-        out({"workspaceId": ws_id, "cwd": db[ws_id]})
+        out({"workspaceId": ws_id, "cwd": db[ws_id]} if mode == "existing-cwd" else {"workspaceId": ws_id})
     if mode == "no-cwd-rename-concurrent":
         subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", branch, str(root / "concurrent-wt"), base])
     if mode == "concurrent-branch":
@@ -102,6 +105,8 @@ if argv[:2] == ["workspace", "create"]:
         sys.exit(1)
     db[ws_id] = str(wt)
     db_path.write_text(json.dumps(db))
+    if "--background" in argv:
+        bg_path.write_text(json.dumps(bg_ids + [ws_id]))
     if mode in ("no-cwd", "no-cwd-rename-concurrent"):
         out({"workspaceId": ws_id})
     out({"workspaceId": ws_id, "cwd": str(wt), "background": "--background" in argv})
@@ -566,17 +571,107 @@ class PaseoBackendTest(FlowTestBase):
         self.assertNotEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
         self.assertIn(str(concurrent), self.git(self.repo, "worktree", "list"))
 
-    def test_missing_cwd_unresolvable_archives_workspace_but_deletes_no_branch(self) -> None:
+    def test_missing_cwd_unresolvable_never_archives(self) -> None:
         self.gear1_ready()
         self.git(self.repo, "branch", "unrelated/keep")
         os.environ["MOCK_PASEO_MODE"] = "no-cwd"
         with mock.patch.object(flow, "_lookup_workspace_cwd", return_value=None):
-            self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
-                        contains="no workspaceId/cwd")
-        self.assertIn(["workspace", "archive", "wks_1"], [c["argv"] for c in self.calls()])
+            err = self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                              contains="unverified workspace_id=wks_1 left untouched")
+        self.assertIn("no workspaceId/cwd", err)
+        self.assertFalse([c for c in self.calls() if c["argv"][:2] == ["workspace", "archive"]])
+        self.assertTrue((self.mock_root / "worktrees" / "wks_1").is_dir())
         self.assertNotEqual(self.git(self.repo, "branch", "--list", "unrelated/keep"), "")
-        # Ownership cannot be proven without the worktree path, so the requested branch is left alone.
         self.assertNotEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
+        self.assertNotIn("main-fix", self.state()["slices"])
+
+    def test_missing_cwd_pointing_at_existing_user_worktree_is_left_untouched(self) -> None:
+        self.gear1_ready()
+        user_wt = self.tmp / "user-wip"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "user/wip", str(user_wt))
+        (user_wt / "notes.txt").write_text("untracked notes\n")
+        os.environ["MOCK_PASEO_MODE"] = "no-cwd-existing"
+        os.environ["MOCK_PASEO_EXISTING_CWD"] = str(user_wt)
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                    contains="unverified workspace_id=wks_1 left untouched")
+        self.assertFalse([c for c in self.calls() if c["argv"][:2] == ["workspace", "archive"]])
+        self.assertEqual((user_wt / "notes.txt").read_text(), "untracked notes\n")
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "user/wip"), "")
+
+    def test_missing_cwd_background_workspace_resolved_via_background_listing(self) -> None:
+        self.gear1_ready()
+        os.environ["MOCK_PASEO_MODE"] = "no-cwd"
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                    "--background", contains="no workspaceId/cwd")
+        ls_calls = [c["argv"] for c in self.calls() if c["argv"][:2] == ["workspace", "ls"]]
+        self.assertEqual(ls_calls[0], ["workspace", "ls", "--background", "--json"])
+        self.assertIn(["workspace", "archive", "wks_1"], [c["argv"] for c in self.calls()])
+        self.assertFalse((self.mock_root / "worktrees" / "wks_1").exists())
+        self.assertEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
+        # The foreground listing alone hides background workspaces, so it could not have resolved wks_1.
+        fg = subprocess.run([os.environ["PASEO_BIN"], "workspace", "ls", "--json"], stdout=subprocess.PIPE)
+        self.assertNotIn(b"wks_1", fg.stdout)
+
+    def test_worktree_listing_handles_newline_paths_and_strict_failure_aborts(self) -> None:
+        self.gear1_ready()
+        odd = self.tmp / "odd\nname"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "user/odd", str(odd))
+        listing = flow.worktree_branches(self.repo, strict=True)
+        self.assertIn(odd.resolve(), listing)
+        branch, head = listing[odd.resolve()]
+        self.assertEqual(branch, "user/odd")
+        self.assertEqual(head, self.git(self.repo, "rev-parse", "HEAD"))
+        os.environ["MOCK_PASEO_MODE"] = "existing-cwd"
+        os.environ["MOCK_PASEO_EXISTING_CWD"] = str(odd)
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                    contains="pre-existing worktree")
+        self.assertTrue(odd.is_dir())
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "user/odd"), "")
+        self.assertFalse([c for c in self.calls() if c["argv"][:2] == ["workspace", "archive"]])
+
+        real_git_raw = flow.git_raw
+
+        def failing(repo, *args, **kw):
+            if args[:2] == ("worktree", "list"):
+                return subprocess.CompletedProcess(["git"], 128, b"", b"fatal: simulated listing failure")
+            return real_git_raw(repo, *args, **kw)
+
+        os.environ["MOCK_PASEO_MODE"] = "ok"
+        n_calls = len(self.calls())
+        with mock.patch.object(flow, "git_raw", side_effect=failing):
+            self.assertEqual(flow.worktree_branches(self.repo), {})
+            with self.assertRaises(flow.FlowError):
+                flow.worktree_branches(self.repo, strict=True)
+            self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                        contains="simulated listing failure")
+        self.assertEqual(len(self.calls()), n_calls)
+        self.assertEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
+
+    def test_rollback_branch_delete_is_cas_on_recorded_oid(self) -> None:
+        self.gear1_ready()
+        tree = self.git(self.repo, "rev-parse", "HEAD^{tree}")
+        advanced = self.git(self.repo, "commit-tree", tree, "-p", "HEAD", "-m", "concurrent advance")
+        real_run_paseo = flow.run_paseo
+
+        def racing(ctx, argv):
+            out = real_run_paseo(ctx, argv)
+            if argv[:2] == ["workspace", "archive"]:
+                self.git(self.repo, "worktree", "prune")
+                self.git(self.repo, "update-ref", "refs/heads/fix/answer-1", advanced)
+            return out
+
+        os.environ["MOCK_PASEO_MODE"] = "rename-branch"
+        with mock.patch.object(flow, "run_paseo", side_effect=racing):
+            self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                        contains="silent rename")
+        self.assertFalse((self.mock_root / "worktrees" / "wks_1").exists())
+        self.assertEqual(self.git(self.repo, "rev-parse", "refs/heads/fix/answer-1"), advanced)
+
+        # Without a concurrent advance the owned branch is deleted.
+        os.environ["MOCK_PASEO_MODE"] = "rename-branch"
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/other", "--backend", "paseo",
+                    contains="silent rename")
+        self.assertEqual(self.git(self.repo, "branch", "--list", "fix/other-1"), "")
 
     def test_missing_binary(self) -> None:
         self.gear1_ready()

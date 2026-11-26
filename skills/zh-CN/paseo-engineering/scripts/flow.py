@@ -432,25 +432,33 @@ def paseo_create_worktree(ctx: Ctx, repo: Path, branch: str, base: str, backgrou
     if not ws_id or not cwd:
         err = FlowError(f"paseo workspace create returned no workspaceId/cwd: {ws!r}")
         err.workspace_id = ws_id  # type: ignore[attr-defined]  # caller archives what was created
-        err.worktree = _lookup_workspace_cwd(ctx, ws_id) if ws_id else None  # type: ignore[attr-defined]
+        err.worktree = _lookup_workspace_cwd(ctx, ws_id, background) if ws_id else None  # type: ignore[attr-defined]
         raise err
     return project_id, ws_id, Path(cwd)
 
 
-def _lookup_workspace_cwd(ctx: Ctx, ws_id: str) -> Optional[Path]:
-    """Resolve a workspace's checkout path strictly by its id via ``paseo workspace ls --json``."""
-    try:
-        listing = parse_json_output(run_paseo(ctx, ["workspace", "ls", "--json"]))
-    except FlowError:
-        return None
-    if isinstance(listing, dict):
-        listing = listing.get("workspaces")
-    if not isinstance(listing, list):
-        return None
-    for item in listing:
-        if isinstance(item, dict) and ws_id in (item.get("workspaceId"), item.get("id")):
-            cwd = pick_field(item, "cwd", "worktreeRoot", "path")
-            return Path(cwd) if cwd else None
+def _lookup_workspace_cwd(ctx: Ctx, ws_id: str, background: bool = False) -> Optional[Path]:
+    """Resolve a workspace's checkout path strictly by its id via ``paseo workspace ls``.
+
+    ``workspace ls`` hides background workspaces unless ``--background`` is passed, so both listings are
+    consulted (the one matching the creation mode first).
+    """
+    fg = ["workspace", "ls", "--json"]
+    bg = ["workspace", "ls", "--background", "--json"]
+    for argv in ((bg, fg) if background else (fg, bg)):
+        try:
+            listing = parse_json_output(run_paseo(ctx, argv))
+        except FlowError:
+            continue
+        if isinstance(listing, dict):
+            listing = listing.get("workspaces")
+        if not isinstance(listing, list):
+            continue
+        for item in listing:
+            if isinstance(item, dict) and ws_id in (item.get("workspaceId"), item.get("id")):
+                cwd = pick_field(item, "cwd", "worktreeRoot", "path")
+                if cwd:
+                    return Path(cwd)
     return None
 
 
@@ -826,19 +834,31 @@ def _verify_new_worktree(repo: Path, wt: Path, branch: str, base: str) -> None:
         raise FlowError(f"worktree HEAD {head} does not match requested base {base} (base ignored)")
 
 
-def worktree_branches(repo: Path) -> Dict[Path, Optional[str]]:
-    """Map every registered worktree path to the local branch checked out there (None if detached)."""
-    res = git_raw(repo, "worktree", "list", "--porcelain")
-    mapping: Dict[Path, Optional[str]] = {}
+def worktree_branches(repo: Path, strict: bool = False) -> Dict[Path, Tuple[Optional[str], Optional[str]]]:
+    """Map every registered worktree path to ``(branch_name, head_oid)`` (branch None if detached).
+
+    Parses ``git worktree list --porcelain -z`` so paths containing newlines are handled; with
+    ``strict=True`` a failing listing aborts instead of silently yielding an empty (unprotected) map.
+    """
+    res = git_raw(repo, "worktree", "list", "--porcelain", "-z")
+    mapping: Dict[Path, Tuple[Optional[str], Optional[str]]] = {}
     if res.returncode != 0:
+        if strict:
+            raise FlowError(f"git worktree list --porcelain -z failed in {repo}: {decode(res.stderr).strip()}")
         return mapping
     current: Optional[Path] = None
-    for line in decode(res.stdout).splitlines():
-        if line.startswith("worktree "):
-            current = Path(line[len("worktree "):]).resolve()
-            mapping[current] = None
-        elif line.startswith("branch refs/heads/") and current is not None:
-            mapping[current] = line[len("branch refs/heads/"):]
+    branch: Optional[str] = None
+    head: Optional[str] = None
+    for field in res.stdout.split(b"\0") + [b""]:
+        if field.startswith(b"worktree "):
+            current, branch, head = Path(os.fsdecode(field[len(b"worktree "):])).resolve(), None, None
+        elif current is not None and field.startswith(b"HEAD "):
+            head = decode(field[len(b"HEAD "):]).strip()
+        elif current is not None and field.startswith(b"branch refs/heads/"):
+            branch = os.fsdecode(field[len(b"branch refs/heads/"):])
+        elif not field and current is not None:
+            mapping[current] = (branch, head)
+            current, branch, head = None, None, None
     return mapping
 
 
@@ -850,33 +870,31 @@ def _rollback_isolation(
     before_branches: "set[str]",
     before_worktrees: "set[Path]",
     main_branch: Optional[str],
-) -> None:
-    """Undo ONLY what this isolate call actually created.
+) -> Optional[str]:
+    """Undo ONLY what this isolate call provably created; return a note about anything left untouched.
 
-    ``owned_wt`` is the created worktree unless it was registered before this call (then nothing about
-    it -- workspace, directory, or branch -- is touched). A branch is deleted only if
-    ``git worktree list --porcelain`` binds it to ``owned_wt``; branches are never guessed by name.
+    Nothing is archived, removed, or deleted unless ``owned_wt`` -- a resolved path absent from the
+    pre-call worktree set -- is known. The branch bound to ``owned_wt`` is deleted with a CAS
+    ``update-ref -d <ref> <oid>`` so a concurrently advanced ref survives.
     """
     owned_wt: Optional[Path] = None
-    if wt is not None:
-        resolved = wt.resolve()
-        if resolved in before_worktrees:
-            ws_id = None  # never archive/remove a pre-existing user worktree
-        else:
-            owned_wt = resolved
-    owned_branch: Optional[str] = None
-    if owned_wt is not None:
-        bound = worktree_branches(repo).get(owned_wt)
-        if bound and bound not in before_branches and bound != main_branch:
-            owned_branch = bound
+    if wt is not None and wt.resolve() not in before_worktrees:
+        owned_wt = wt.resolve()
+    if owned_wt is None:
+        return f"unverified workspace_id={ws_id} left untouched" if ws_id else None
+    owned_branch, owned_oid = worktree_branches(repo).get(owned_wt, (None, None))
+    if not (owned_branch and owned_oid and SHA_RE.match(owned_oid)
+            and owned_branch not in before_branches and owned_branch != main_branch):
+        owned_branch = None
     if ws_id:
         with contextlib.suppress(FlowError):
             run_paseo(ctx, ["workspace", "archive", ws_id])
-    if owned_wt is not None and owned_wt.exists():
+    if owned_wt.exists():
         git_raw(repo, "worktree", "remove", "--force", str(owned_wt))
     git_raw(repo, "worktree", "prune")
-    if owned_branch and branch_exists(repo, owned_branch):
-        git_raw(repo, "branch", "-D", owned_branch)
+    if owned_branch:
+        git_raw(repo, "update-ref", "-d", f"refs/heads/{owned_branch}", str(owned_oid))
+    return None
 
 
 def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
@@ -933,7 +951,7 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
         raise FlowError(f"expected_main_head_sha {base!r} is not a 40-hex SHA")
 
     before = set(list_branches(repo))
-    before_worktrees = set(worktree_branches(repo))
+    before_worktrees = set(worktree_branches(repo, strict=True))
     head_ref = git_raw(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
     main_branch = decode(head_ref.stdout).strip() if head_ref.returncode == 0 else None
     used = a.backend
@@ -981,7 +999,9 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
     except FlowError as exc:
         created_ws_id = created_ws_id or getattr(exc, "workspace_id", None)
         created_wt = created_wt or getattr(exc, "worktree", None)
-        _rollback_isolation(ctx, repo, created_ws_id, created_wt, before, before_worktrees, main_branch)
+        note = _rollback_isolation(ctx, repo, created_ws_id, created_wt, before, before_worktrees, main_branch)
+        if note:
+            raise FlowError(f"{exc}; {note}", code=exc.code, save=exc.save) from exc
         raise
     ws_id = created_ws_id
 
