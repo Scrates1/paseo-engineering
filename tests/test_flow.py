@@ -77,6 +77,10 @@ if argv[:2] == ["project", "create"]:
     out({"projectId": "prj_mock", "path": argv[-1]})
 if argv[:2] == ["workspace", "create"]:
     repo, branch, base = opt("--path"), opt("--new-branch"), opt("--base")
+    if mode == "concurrent-branch":
+        subprocess.run(["git", "-C", repo, "branch", "other/concurrent", base])
+        sys.stderr.write("Error: internal workspace failure\n")
+        sys.exit(1)
     actual = branch + "-1" if mode == "rename-branch" else branch
     ws_id = "wks_%d" % (len(db) + 1)
     wt = root / "worktrees" / ws_id
@@ -88,6 +92,8 @@ if argv[:2] == ["workspace", "create"]:
         sys.exit(1)
     db[ws_id] = str(wt)
     db_path.write_text(json.dumps(db))
+    if mode == "no-cwd":
+        out({"workspaceId": ws_id})
     out({"workspaceId": ws_id, "cwd": str(wt), "background": "--background" in argv})
 if argv[:2] == ["workspace", "archive"]:
     wt = db.get(argv[2])
@@ -450,6 +456,45 @@ class PaseoBackendTest(FlowTestBase):
         self.assertEqual(sl["backend"], "git")
         self.assertEqual(Path(sl["worktree"]), (self.run_dir / "worktrees" / "main-fix").resolve())
 
+    def test_isolate_rollback_preserves_foreign_worktree_and_unrelated_branches(self) -> None:
+        self.gear1_ready()
+        user_wt = self.tmp / "user-wip"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "user/wip", str(user_wt))
+        (user_wt / "app.py").write_text("uncommitted user edit\n")
+        (user_wt / "notes.txt").write_text("untracked user notes\n")
+        self.git(self.repo, "branch", "concurrent/task")
+        user_status = self.git(user_wt, "status", "--porcelain")
+        branches_before = set(self.git(self.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").split())
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "git",
+                    "--worktree-dir", str(user_wt), contains="already exists and is not empty")
+        self.assertTrue(user_wt.is_dir())
+        self.assertEqual((user_wt / "app.py").read_text(), "uncommitted user edit\n")
+        self.assertEqual((user_wt / "notes.txt").read_text(), "untracked user notes\n")
+        self.assertEqual(self.git(user_wt, "status", "--porcelain"), user_status)
+        self.assertIn(str(user_wt), self.git(self.repo, "worktree", "list"))
+        branches_after = set(self.git(self.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").split())
+        self.assertEqual(branches_after, branches_before)
+        self.assertNotIn("main-fix", self.state()["slices"])
+
+        # A branch created concurrently while our paseo call fails must survive the rollback.
+        os.environ["MOCK_PASEO_MODE"] = "concurrent-branch"
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                    contains="internal workspace failure")
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "other/concurrent"), "")
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "concurrent/task"), "")
+        self.assertEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
+
+    def test_paseo_workspace_without_cwd_is_archived_and_branch_removed(self) -> None:
+        self.gear1_ready()
+        os.environ["MOCK_PASEO_MODE"] = "no-cwd"
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                    contains="no workspaceId/cwd")
+        self.assertIn(["workspace", "archive", "wks_1"], [c["argv"] for c in self.calls()])
+        self.assertFalse((self.mock_root / "worktrees" / "wks_1").exists())
+        self.assertEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
+        self.assertNotIn("wks_1", self.git(self.repo, "worktree", "list"))
+        self.assertNotIn("main-fix", self.state()["slices"])
+
     def test_missing_binary(self) -> None:
         self.gear1_ready()
         os.environ["PASEO_BIN"] = str(self.tmp / "nope" / "paseo")
@@ -541,6 +586,44 @@ class PaseoBackendTest(FlowTestBase):
         os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"codex": ["gpt-6.1-sol", "gpt-6.2-astra"]})
         self.flow(*args)
         self.assertEqual(self.slice("main-fix")["state"], "IN_REVIEW")
+
+    def test_provider_listing_entries_are_strictly_validated(self) -> None:
+        self.gear1_ready()
+        self.implement("main-fix", "fix/answer", worker=REVIEWER)
+        args = ("enter-review", "--slice", "main-fix", "--reviewer-model", "codex/gpt-6.2-astra", "--single-family-host")
+        os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"codex": ["gpt-6.1-sol", "gpt-6.2-astra"]})
+        codex = {"provider": "codex", "status": "available", "enabled": "Enabled"}
+        bad = [
+            ({"provider": "antigravity", "error": "provider discovery failed"}, "reports an error"),
+            ({"provider": "antigravity", "status": "available", "enabled": "Enabled", "error": "x"}, "reports an error"),
+            ({"provider": "antigravity"}, "missing or unknown status"),
+            ({"provider": "antigravity", "status": None}, "missing or unknown status"),
+            ({"provider": "antigravity", "status": 5}, "missing or unknown status"),
+            ({"provider": "antigravity", "status": "  "}, "missing or unknown status"),
+            ({"provider": "antigravity", "status": "degraded"}, "missing or unknown status"),
+            ({"provider": "antigravity", "status": "available", "enabled": "maybe"}, "invalid enabled flag"),
+            ({"provider": "antigravity", "status": "unavailable", "enabled": 1}, "invalid enabled flag"),
+            ({"provider": "antigravity", "status": "unavailable", "enabled": None}, "invalid enabled flag"),
+        ]
+        for entry, needle in bad:
+            with self.subTest(entry=entry):
+                os.environ["MOCK_PASEO_PROVIDER_LS"] = json.dumps([codex, entry])
+                err = self.reject(*args, contains=needle)
+                self.assertIn("REJECTED", err)
+        self.assertEqual(self.slice("main-fix")["state"], "IMPLEMENTING")
+        # Real Paseo listings: unconfigured plugins report status error/unavailable or are disabled -> skipped.
+        os.environ["MOCK_PASEO_PROVIDER_LS"] = json.dumps([
+            codex,
+            {"provider": "muse", "label": "Muse Code", "status": "error", "enabled": "Enabled", "modes": ""},
+            {"provider": "claude", "status": "unavailable", "enabled": "Enabled"},
+            {"provider": "gemini", "status": " Available ", "enabled": "Disabled"},
+            {"provider": "antigravity", "status": "available", "enabled": False},
+            {"provider": "opencode", "status": "UNAVAILABLE", "enabled": True},
+        ])
+        self.flow(*args)
+        self.assertEqual(self.slice("main-fix")["state"], "IN_REVIEW")
+        probed = [c["argv"][2] for c in self.calls() if c["argv"][:2] == ["provider", "models"]]
+        self.assertEqual(set(probed), {"codex"})
 
 
 class GearTwoFlowTest(FlowTestBase):

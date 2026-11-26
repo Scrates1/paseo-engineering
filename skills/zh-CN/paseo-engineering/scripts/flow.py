@@ -47,6 +47,8 @@ TERMINAL_SLICE_STATES = ("INTEGRATED", "DISCARDED", "SPIKE_CLOSED")
 EXIT_GATE = 2
 EXIT_CONFLICT = 3
 EXIT_VERIFY_FAILED = 4
+PROVIDER_STATUSES = ("available", "unavailable", "error")
+PROVIDER_ENABLED_VALUES = ("enabled", "disabled", "true", "false")
 
 DAEMON_DOWN_RE = re.compile(
     r"econnrefused|not running|could not connect|cannot connect|couldn't connect|unable to connect|"
@@ -355,13 +357,24 @@ def online_model_specs(ctx: Ctx) -> List[str]:
     for item in providers:
         if not isinstance(item, dict):
             raise FlowError(f"malformed provider entry in 'paseo provider ls --json': {item!r}")
+        if "error" in item:
+            raise FlowError(f"provider entry reports an error: {item!r}")
         raw_name = item.get("provider", item.get("id"))
         if not isinstance(raw_name, str) or not raw_name.strip():
             raise FlowError(f"provider entry without a valid string identifier: {item!r}")
         name = raw_name.strip()
-        status = str(item.get("status", "")).lower()
-        enabled = str(item.get("enabled", "enabled")).lower()
-        if status != "available" or enabled in ("disabled", "false"):
+        raw_status = item.get("status")
+        if not isinstance(raw_status, str) or raw_status.strip().lower() not in PROVIDER_STATUSES:
+            raise FlowError(f"provider {name!r} has a missing or unknown status: {item!r}")
+        status = raw_status.strip().lower()
+        raw_enabled = item.get("enabled", True)
+        if isinstance(raw_enabled, bool):
+            enabled = raw_enabled
+        elif isinstance(raw_enabled, str) and raw_enabled.strip().lower() in PROVIDER_ENABLED_VALUES:
+            enabled = raw_enabled.strip().lower() in ("enabled", "true")
+        else:
+            raise FlowError(f"provider {name!r} has an invalid enabled flag: {item!r}")
+        if status != "available" or not enabled:
             continue
         models = parse_json_output(run_paseo(ctx, ["provider", "models", name, "--json"]))
         if not isinstance(models, list) or not models:
@@ -413,10 +426,9 @@ def paseo_create_worktree(ctx: Ctx, repo: Path, branch: str, base: str, backgrou
     ws_id = pick_field(ws, "workspaceId", "id")
     cwd = pick_field(ws, "cwd", "worktreeRoot", "path")
     if not ws_id or not cwd:
-        if ws_id:
-            with contextlib.suppress(FlowError):
-                run_paseo(ctx, ["workspace", "archive", ws_id])
-        raise FlowError(f"paseo workspace create returned no workspaceId/cwd: {ws!r}")
+        err = FlowError(f"paseo workspace create returned no workspaceId/cwd: {ws!r}")
+        err.workspace_id = ws_id  # type: ignore[attr-defined]  # caller archives what was created
+        raise err
     return project_id, ws_id, Path(cwd)
 
 
@@ -792,15 +804,37 @@ def _verify_new_worktree(repo: Path, wt: Path, branch: str, base: str) -> None:
         raise FlowError(f"worktree HEAD {head} does not match requested base {base} (base ignored)")
 
 
-def _rollback_isolation(ctx: Ctx, repo: Path, ws_id: Optional[str], wt: Optional[Path], before: List[str]) -> None:
+def _rollback_isolation(
+    ctx: Ctx,
+    repo: Path,
+    ws_id: Optional[str],
+    wt: Optional[Path],
+    branch: Optional[str],
+    before: "set[str]",
+    main_branch: Optional[str],
+) -> None:
+    """Undo ONLY what this isolate call created; never touch pre-existing dirs or unrelated branches."""
+    doomed: List[str] = []
+    if branch and branch not in before and branch_exists(repo, branch):
+        doomed.append(branch)
+    if wt is not None and wt.is_dir():
+        res = git_raw(wt, "rev-parse", "--abbrev-ref", "HEAD")
+        actual = decode(res.stdout).strip() if res.returncode == 0 else ""
+        same_repo = False
+        with contextlib.suppress(FlowError):
+            same_repo = git_common_dir(wt) == git_common_dir(repo)
+        if same_repo and actual and actual != "HEAD" and actual != main_branch and actual not in before \
+                and actual not in doomed:
+            doomed.append(actual)
     if ws_id:
         with contextlib.suppress(FlowError):
             run_paseo(ctx, ["workspace", "archive", ws_id])
     if wt is not None and wt.exists():
         git_raw(repo, "worktree", "remove", "--force", str(wt))
     git_raw(repo, "worktree", "prune")
-    for name in set(list_branches(repo)) - set(before):
-        git_raw(repo, "branch", "-D", name)
+    for name in doomed:
+        if branch_exists(repo, name):
+            git_raw(repo, "branch", "-D", name)
 
 
 def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
@@ -856,33 +890,40 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
     if not SHA_RE.match(base):
         raise FlowError(f"expected_main_head_sha {base!r} is not a 40-hex SHA")
 
-    before = list_branches(repo)
+    before = set(list_branches(repo))
+    head_ref = git_raw(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    main_branch = decode(head_ref.stdout).strip() if head_ref.returncode == 0 else None
     used = a.backend
     notes: List[str] = []
-    ws_id: Optional[str] = None
+    created_ws_id: Optional[str] = None
+    created_wt: Optional[Path] = None
+    create_attempted = False
     proj_id: Optional[str] = None
-    wt: Optional[Path] = None
     try:
         if a.backend in ("paseo", "auto"):
             try:
-                proj_id, ws_id, wt = paseo_create_worktree(ctx, repo, branch, base, a.background)
+                create_attempted = True
+                proj_id, created_ws_id, created_wt = paseo_create_worktree(ctx, repo, branch, base, a.background)
                 used = "paseo"
             except PaseoUnavailable as exc:
+                create_attempted = False
                 if a.backend == "paseo":
                     raise FlowError(f"--backend paseo failed hard: {exc}")
                 notes.append(f"auto backend fell back to git worktree: {exc}")
                 used = "git"
         if used == "git":
-            wt = Path(a.worktree_dir).expanduser() if a.worktree_dir else ctx.run_dir / "worktrees" / sid
-            wt = wt.resolve()
-            if wt.exists() and (not wt.is_dir() or any(wt.iterdir())):
-                raise FlowError(f"worktree directory {wt} already exists and is not empty")
-            wt.parent.mkdir(parents=True, exist_ok=True)
-            res = git_raw(repo, "worktree", "add", "-b", branch, str(wt), base)
+            candidate_wt = Path(a.worktree_dir).expanduser() if a.worktree_dir else ctx.run_dir / "worktrees" / sid
+            candidate_wt = candidate_wt.resolve()
+            if candidate_wt.exists() and (not candidate_wt.is_dir() or any(candidate_wt.iterdir())):
+                raise FlowError(f"worktree directory {candidate_wt} already exists and is not empty")
+            candidate_wt.parent.mkdir(parents=True, exist_ok=True)
+            create_attempted = True
+            res = git_raw(repo, "worktree", "add", "-b", branch, str(candidate_wt), base)
             if res.returncode != 0:
                 raise FlowError(f"git worktree add failed: {decode(res.stderr).strip()}")
-        assert wt is not None
-        wt = wt.resolve()
+            created_wt = candidate_wt
+        assert created_wt is not None
+        wt = created_wt.resolve()
         _verify_new_worktree(repo, wt, branch, base)
         slice_base, dirty_sha, has_dirty = base, None, False
         if a.apply_dirty_patch and not snap["is_clean"]:
@@ -892,9 +933,12 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
             has_dirty = True
         elif a.apply_dirty_patch:
             notes.append("--apply-dirty-patch ignored: main repository is clean")
-    except FlowError:
-        _rollback_isolation(ctx, repo, ws_id, wt, before)
+    except FlowError as exc:
+        created_ws_id = created_ws_id or getattr(exc, "workspace_id", None)
+        _rollback_isolation(ctx, repo, created_ws_id, created_wt, branch if create_attempted else None,
+                            before, main_branch)
         raise
+    ws_id = created_ws_id
 
     if prev:
         st["slice_archive"].append(prev)
