@@ -80,7 +80,7 @@
 
 所有涉及代码改动的档位均遵循统一的五步协议，每个关键节点都经 `scripts/flow.py` 过闸——即使候选方案最终被证伪撤回，主工作区和全局依赖缓存（如 `~/.m2`、虚拟环境）也始终保持原状零污染：
 
-1. **快照与隔离**：`init` → `triage` →（Gear 2/3：`record-explore` → `record-redteam` → `align` → `record-prereview`）→ `isolate` 基于明确的 `BASE_SHA` 创建 Paseo 原生受管 worktree。
+1. **快照与隔离**：`init` → `triage` →（Gear 2：`record-explore` → `record-redteam` → `align` → `record-prereview`；Gear 3：`record-explore` → `record-redteam` → `align --spike-hypothesis ... --spike-samples ... --go-criteria ...`，通过后直达 `EXECUTION_READY`，**无需** `record-prereview`）→ `isolate` 基于明确的 `BASE_SHA` 创建 Paseo 原生受管 worktree（Gear 3 使用 `isolate --kind spike`）。
 2. **派发**：`paseo run --workspace <workspaceId> --cwd <wt> ...` + `assign-worker` 登记 `[Worker]` 及其模型家族。
 3. **实现与提交**：先实证根因假设 → 在源头 `Y` 修复 → 反例测试 → 干净提交（`record-verify-fail` 记账失败轮次）。
 4. **异构审查**：`enter-review`（家族 + 干净已提交门禁）→ `record-review`（Gear 2：视角 `A` 与 `B` 在同一 `wt_head_sha` 上），上限 2 轮。

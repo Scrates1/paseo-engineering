@@ -80,7 +80,7 @@ Escape hatches stay bounded: `--re-triage` changes course legitimately, and `--u
 
 All code-producing gears follow one five-step protocol, with each checkpoint passing through `scripts/flow.py`—so your main checkout and global caches (`~/.m2`, virtualenvs) remain untouched even when an experiment is discarded:
 
-1. **Snapshot & Isolate**: `init` → `triage` → (Gear 2/3: `record-explore` → `record-redteam` → `align` → `record-prereview`) → `isolate` cuts a Paseo-native managed worktree pinned to the explicit `BASE_SHA`.
+1. **Snapshot & Isolate**: `init` → `triage` → (Gear 2: `record-explore` → `record-redteam` → `align` → `record-prereview`; Gear 3: `record-explore` → `record-redteam` → `align --spike-hypothesis ... --spike-samples ... --go-criteria ...`, going straight to `EXECUTION_READY` with **no** `record-prereview`) → `isolate` cuts a Paseo-native managed worktree pinned to the explicit `BASE_SHA` (Gear 3 uses `isolate --kind spike`).
 2. **Dispatch**: `paseo run --workspace <workspaceId> --cwd <wt> ...` + `assign-worker` registers the `[Worker]` and its model family.
 3. **Implement & Commit**: verify the root hypothesis → fix at root `Y` → counterexample tests → clean commits (`record-verify-fail` logs failed rounds).
 4. **Cross-Model Review**: `enter-review` (family + clean-commit gates) → `record-review` (Gear 2: lenses `A` and `B` on the same `wt_head_sha`), capped at 2 rounds.

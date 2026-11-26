@@ -46,7 +46,7 @@ python3 <skill-dir>/scripts/flow.py --task-id <task-id> triage --symptom <X> --r
 3. **按本质挂入三档工作流**（并按问题属性叠加专项硬约束卡：性能必读 [references/lens-performance.md](references/lens-performance.md)，缺陷/漏误报必读 [references/lens-bug-precision.md](references/lens-bug-precision.md)，重构/架构必读 [references/lens-refactor-arch.md](references/lens-refactor-arch.md)）：
    - **Gear 1 · 源头快修（本质 A：源头唯一明确、无多方案分歧）** → **0 次人工停顿**，`triage --gear 1` 直达 `EXECUTION_READY`，随后走第 4 节隔离开发与异构快审闭环（`1 隔离 Worker + 1 异构 Reviewer`，省去发散与预审）。若构建/测试（`record-verify-fail`）或异构审查（`record-review --verdict BLOCKING`）连续 **2 轮**未通过，或发现跨层耦合，守门员**自动熔断升入 Gear 2**（`MUST_ESCALATE_GEAR2`；绝不带 `BLOCKING` 合入，也不在 Gear 1 原地拉锯）。
    - **Gear 2 · 深度攻坚（本质 B：多路径权衡、跨模块/跨上游库、严苛性能或精度要求）** → 读取 [references/mode-deep-solve.md](references/mode-deep-solve.md)（`Explorer` 三范式发散 → `Red-Team` 异构证伪 → **停顿 1 次与用户拍板** → 双视角预审 → 隔离并行 `Worker` → 双视角异构 `Reviewer` 与数据审计）。守门员路径：`triage` → `record-explore` → `record-redteam` → `align` → `record-prereview` → `EXECUTION_READY`。
-   - **Gear 3 · 探索立项（本质 C：现有机制空白、`0 → 1` 路线未知）** → 读取 [references/mode-explore-spike.md](references/mode-explore-spike.md)（内外双线 `Explorer` → `Red-Team` 事前验尸 → **停顿 1 定 PoC 契约** → 隔离 `Worker` 跑轻量探针 + 强制异构 `[Reviewer-Audit]` 审计探针原始数据 → **停顿 2 定 Go/Pivot/Kill**；Go 后丢弃草稿探针并转入 Gear 2 后半段正式生产级落地）。守门员路径：`triage` → `record-explore` → `record-redteam` → `align --spike-hypothesis ... --spike-samples ... --go-criteria ...` → `EXECUTION_READY` → `isolate --kind spike` → … → `decide-spike`。
+   - **Gear 3 · 探索立项（本质 C：现有机制空白、`0 → 1` 路线未知）** → 读取 [references/mode-explore-spike.md](references/mode-explore-spike.md)（内外双线 `Explorer` → `Red-Team` 事前验尸 → **停顿 1 定 PoC 契约** → 隔离 `Worker` 跑轻量探针 + 强制异构 `[Reviewer-Audit]` 审计探针原始数据 → **停顿 2 定 Go/Pivot/Kill**；Go 后丢弃草稿探针并转入 Gear 2 后半段正式生产级落地）。守门员路径：`triage` → `record-explore` → `record-redteam` → `align --spike-hypothesis ... --spike-samples ... --go-criteria ...` → `EXECUTION_READY` → `isolate --kind spike` → … → `decide-spike --decision go --slices <prod-slices>`（随后 Gear 2 `record-prereview` + `isolate --kind production`）。
 4. **重诊（Re-Triage）**：`[Worker]` 实证推翻根因假设或触发升档时，执行 `triage ... --re-triage`；它会作废此前的探路/红队/预审凭证与已对齐切片，并把所有未合入切片标记为 `SUPERSEDED`（只能丢弃，不能再合入）。
 
 ## 4. 守门员状态机与 Paseo 原生隔离五步闭环
@@ -76,7 +76,7 @@ python3 <skill-dir>/scripts/flow.py --task-id <task-id> triage --symptom <X> --r
 | 隔离与实现 | `isolate` → `assign-worker` → *（构建/测试失败时）* `record-verify-fail` |
 | 异构审查 | `enter-review` → `record-review` *（Gear 2：视角 `A` 与 `B` 须在同一 `wt_head_sha` 上都 `PASS`；探针用 `audit`）* → 有争议时 `resolve-dispute` |
 | 落地 | `integrate` *（冲突 → Worker rebase → `mark-rebased` → 重新审查）* → `verify-integration` |
-| 探针 / 弃置 | `decide-spike --decision go\|pivot\|kill` · `discard-slice` |
+| 探针 / 弃置 | `decide-spike --decision go\|pivot\|kill [--slices <prod-slices>]` *（`go` 后用 `--slices` 指定全新生产切片，缺省 `<id>-prod`）* · `discard-slice` |
 
 ### 4.3 五步闭环
 

@@ -43,7 +43,7 @@
 
 ### Stage 1 · 双视角异构方案预审（2 个并行 Paseo `[Reviewer]` 只读子会话）
 
-动代码前编写可证伪实施规格（不变量、反例清单、精确文件范围、验证口径），通过 Paseo 并行启动两个独立只读预审会话（至少其一与后续 `[Worker]` 跨模型家族）：
+动代码前编写可证伪实施规格（不变量、反例清单、精确文件范围、验证口径），通过 Paseo 并行启动两个独立只读预审会话（当在线模型家族数 `N ≥ 2` 时，预审员 `A` 与 `B` **两位均必须**与所有计划及实际派工的 `[Worker]` 模型家族异构；`assign-worker` 会再次核验该绑定，拒绝派发与任一预审员同族的 Worker）：
 
 - **`[Reviewer-Pre-A]`（语义与不变量视角）**：审业务/分析语义守恒、状态生命周期、并发安全、异常与退化守恒、兼容性。
 - **`[Reviewer-Pre-B]`（可验证性与隔离视角）**：审反例测试能否真正拦截错误实现、worktree 与本地依赖缓存零污染方案、实证对比口径公平性。
@@ -56,7 +56,7 @@
   python3 <skill-dir>/scripts/flow.py --task-id <task-id> isolate --slice <slice> --branch <new-branch> --kind production [--backend auto|paseo|git] [--apply-dirty-patch]
   ```
   `auto` 后端依次执行 `paseo project create` + `paseo workspace create --isolation worktree --mode branch-off --new-branch <new-branch> --base <BASE_SHA>`，并记录 `workspaceId`、`cwd` 与 `slice_base`；仅外部仓库或 Paseo 不可用时才回退 `git worktree add -b`。若依赖主工作区未提交补丁，`--apply-dirty-patch` 会将其单独提交为前置 `SLICE_BASE`（之后须用 `integrate --into-worktree` 合入）。凡涉及写入包缓存或修改二方库均配置独立本地缓存目录。
-- 以 **Workspace + 目录双重绑定**启动 `[Worker]`（`paseo run --no-wait -q --provider <p> --model <m> --workspace <workspaceId> --cwd <wt> --title "[Worker] <slice>"`；并发写会话默认 ≤ 2 个），并登记：`assign-worker --slice <slice> --model <provider/model> --agent-id <id>`。
+- 以 **Workspace + 目录双重绑定**启动 `[Worker]`（`paseo run --no-wait -q --provider <p> --model <m> --workspace <workspaceId> --cwd <wt> --title "[Worker] <slice>"`；并发写会话默认 ≤ 2 个），并登记：`assign-worker --slice <slice> --model <provider/model> --agent-id <id>`（若 `[Worker]` 家族与任一已登记预审员同族则被拒绝）。
 - **实证退单权**：`[Worker]` 先验证根因假设，若动态实证推翻假设则立即停工退回协调官（随后 `triage --re-triage`）。
 - **反例测试先行与干净提交**：除常规回归外，`[Worker]` 必须将 Step 3 与 Stage 1 识别的全部边界陷阱写成自动化反例单测并在隔离分支内跑绿（重型测试按宿主机负载串行执行），最后在隔离分支完成干净的本地 Git 提交。构建/测试失败轮次经 `record-verify-fail --slice <slice> --summary <text>` 记账。
 

@@ -43,8 +43,8 @@
 
 ## Step 5 · 第二次拍板：Go / Pivot / Kill 裁决与流转
 
-协调官汇报经异构审计核实的真实探针表现与天花板，**停顿等待第二次拍板**，并以 `decide-spike --slice <spike-slice> --decision go|pivot|kill --summary <text>` 登记裁决（要求 `SPIKE_AUDITED`）。无论哪种裁决，守门员都会归档探针 workspace（`paseo workspace archive`，或 `git worktree remove`）并删除 `spike/<topic>` 分支：
+协调官汇报经异构审计核实的真实探针表现与天花板，**停顿等待第二次拍板**，并以 `decide-spike --slice <spike-slice> --decision go|pivot|kill [--slices <prod-slices>] --summary <text>` 登记裁决（要求 `SPIKE_AUDITED`）。无论哪种裁决，守门员都会归档探针 workspace（`paseo workspace archive`，或 `git worktree remove`）并删除 `spike/<topic>` 分支：
 
-- **Go（确认立项）**：严禁将粗糙 PoC 直接合入主干。任务转入 Gear 2 `ALIGNED`：先执行 `record-prereview`（双视角异构预审），再 `isolate --kind production` 创建**全新**受管 worktree，无缝切入 [mode-deep-solve.md](mode-deep-solve.md) **后半段（Stage 2 规范实现与反例测试 → Stage 3 跨模型双后审与无冲突串行合入）**。
+- **Go（确认立项）**：严禁将粗糙 PoC 直接合入主干。使用 `decide-spike --slice <spike-slice> --decision go --slices <prod-slices> --summary <text>`，其中 `--slices` 指定转入 Gear 2 后**全新的生产切片**列表（省略时默认生成 `<spike-slice>-prod`）。任务转入 Gear 2 `ALIGNED`：先执行 `record-prereview`（双视角异构预审），再 `isolate --kind production` 创建**全新**受管 worktree，无缝切入 [mode-deep-solve.md](mode-deep-solve.md) **后半段（Stage 2 规范实现与反例测试 → Stage 3 跨模型双后审与无冲突串行合入）**。
 - **Pivot（切换路线）**：任务回到 `PREMORTEM_DONE`；在 `status.md` 归档本轮实测边界，回到 **Step 3** 与用户确认新路线的 Spike 契约（再次 `align --spike-hypothesis ...`）后再跑下一轮轻量探针。
 - **Kill（低成本终止）**：归档不可行实证结论；任务置为 `DISCARDED`，临时探针 worktree 与分支被移除，主工作区保持原状零污染。

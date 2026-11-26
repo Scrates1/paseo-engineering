@@ -43,7 +43,7 @@ Part 2 is driven by the Gatekeeper (`scripts/flow.py`; see Section 4 of `SKILL.m
 
 ### Stage 1 · Dual-Lens Pre-Review (2 Parallel Paseo `[Reviewer]` Read-Only Sessions)
 
-Draft a falsifiable implementation spec (invariants, counterexamples, exact file scope, verification protocol) and spawn two parallel read-only Paseo pre-review sessions (at least one from a different model family than the planned `[Worker]`):
+Draft a falsifiable implementation spec (invariants, counterexamples, exact file scope, verification protocol) and spawn two parallel read-only Paseo pre-review sessions (when `N ≥ 2` model families are online, **both** reviewers `A` and `B` must belong to families different from every planned and actually dispatched `[Worker]`; `assign-worker` re-checks this binding and refuses a `[Worker]` whose family matches either pre-reviewer):
 
 - **`[Reviewer-Pre-A]` (Semantics & Invariants)**: Behavioral equivalence, state lifecycle, concurrency safety, exception/degradation conservation, compatibility.
 - **`[Reviewer-Pre-B]` (Verifiability & Isolation)**: Counterexample test effectiveness, worktree/package-cache zero-pollution plan, fairness of empirical comparisons.
@@ -56,7 +56,7 @@ Draft a falsifiable implementation spec (invariants, counterexamples, exact file
   python3 <skill-dir>/scripts/flow.py --task-id <task-id> isolate --slice <slice> --branch <new-branch> --kind production [--backend auto|paseo|git] [--apply-dirty-patch]
   ```
   `auto` runs `paseo project create` + `paseo workspace create --isolation worktree --mode branch-off --new-branch <new-branch> --base <BASE_SHA>` and records `workspaceId`, `cwd`, and `slice_base`; it falls back to `git worktree add -b` only for external repos or when Paseo is unavailable. If the task depends on uncommitted main-checkout edits, `--apply-dirty-patch` commits them as a standalone `SLICE_BASE` (merge later via `integrate --into-worktree`). Configure isolated local package caches whenever package-writing commands or upstream library builds are involved.
-- Spawn each `[Worker]` bound to **both** the managed Workspace and the directory (`paseo run --no-wait -q --provider <p> --model <m> --workspace <workspaceId> --cwd <wt> --title "[Worker] <slice>"`; max 2 concurrent writers by default) and register it: `assign-worker --slice <slice> --model <provider/model> --agent-id <id>`.
+- Spawn each `[Worker]` bound to **both** the managed Workspace and the directory (`paseo run --no-wait -q --provider <p> --model <m> --workspace <workspaceId> --cwd <wt> --title "[Worker] <slice>"`; max 2 concurrent writers by default) and register it: `assign-worker --slice <slice> --model <provider/model> --agent-id <id>` (refused if the `[Worker]`'s family equals that of either recorded pre-reviewer).
 - **Right to Challenge**: `[Worker]` verifies the root hypothesis first and returns empirical evidence to the Coordinator if refuted (then `triage --re-triage`).
 - **Counterexamples First & Clean Commits**: `[Worker]` implements automated counterexample tests for every trap surfaced in Step 3 and Stage 1 alongside standard regressions (serializing heavy test runs against host load), and commits cleanly on the isolated branch with zero untracked residue. Failed build/test rounds go through `record-verify-fail --slice <slice> --summary <text>`.
 
