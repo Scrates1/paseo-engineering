@@ -367,7 +367,9 @@ def online_model_specs(ctx: Ctx) -> List[str]:
         if not isinstance(raw_status, str) or raw_status.strip().lower() not in PROVIDER_STATUSES:
             raise FlowError(f"provider {name!r} has a missing or unknown status: {item!r}")
         status = raw_status.strip().lower()
-        raw_enabled = item.get("enabled", True)
+        if "enabled" not in item:
+            raise FlowError(f"provider {name!r} entry lacks an explicit enabled flag: {item!r}")
+        raw_enabled = item["enabled"]
         if isinstance(raw_enabled, bool):
             enabled = raw_enabled
         elif isinstance(raw_enabled, str) and raw_enabled.strip().lower() in PROVIDER_ENABLED_VALUES:
@@ -804,35 +806,55 @@ def _verify_new_worktree(repo: Path, wt: Path, branch: str, base: str) -> None:
         raise FlowError(f"worktree HEAD {head} does not match requested base {base} (base ignored)")
 
 
+def worktree_branches(repo: Path) -> Dict[Path, Optional[str]]:
+    """Map every registered worktree path to the local branch checked out there (None if detached)."""
+    res = git_raw(repo, "worktree", "list", "--porcelain")
+    mapping: Dict[Path, Optional[str]] = {}
+    if res.returncode != 0:
+        return mapping
+    current: Optional[Path] = None
+    for line in decode(res.stdout).splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):]).resolve()
+            mapping[current] = None
+        elif line.startswith("branch refs/heads/") and current is not None:
+            mapping[current] = line[len("branch refs/heads/"):]
+    return mapping
+
+
 def _rollback_isolation(
     ctx: Ctx,
     repo: Path,
     ws_id: Optional[str],
     wt: Optional[Path],
-    branch: Optional[str],
-    before: "set[str]",
+    branch: str,
+    before_branches: "set[str]",
+    before_worktrees: "set[Path]",
     main_branch: Optional[str],
 ) -> None:
-    """Undo ONLY what this isolate call created; never touch pre-existing dirs or unrelated branches."""
-    doomed: List[str] = []
-    if branch and branch not in before and branch_exists(repo, branch):
-        doomed.append(branch)
-    if wt is not None and wt.is_dir():
-        res = git_raw(wt, "rev-parse", "--abbrev-ref", "HEAD")
-        actual = decode(res.stdout).strip() if res.returncode == 0 else ""
-        same_repo = False
-        with contextlib.suppress(FlowError):
-            same_repo = git_common_dir(wt) == git_common_dir(repo)
-        if same_repo and actual and actual != "HEAD" and actual != main_branch and actual not in before \
-                and actual not in doomed:
-            doomed.append(actual)
+    """Undo ONLY what this isolate call actually created.
+
+    A branch is deleted only if it is bound (per ``git worktree list --porcelain``) to a worktree this
+    call created; if no worktree was created, no branch is ever deleted. Pre-existing directories and
+    unrelated/concurrent branches are never touched.
+    """
+    owned: List[str] = []
+    if wt is not None or ws_id:
+        listing = worktree_branches(repo)
+        if wt is not None:
+            bound = [listing.get(wt.resolve())]
+        else:  # paseo returned a workspace id without a cwd: the new worktree carrying our branch
+            bound = [b for p, b in listing.items() if p not in before_worktrees and b == branch]
+        for name in bound:
+            if name and name != main_branch and name not in before_branches and name not in owned:
+                owned.append(name)
     if ws_id:
         with contextlib.suppress(FlowError):
             run_paseo(ctx, ["workspace", "archive", ws_id])
     if wt is not None and wt.exists():
         git_raw(repo, "worktree", "remove", "--force", str(wt))
     git_raw(repo, "worktree", "prune")
-    for name in doomed:
+    for name in owned:
         if branch_exists(repo, name):
             git_raw(repo, "branch", "-D", name)
 
@@ -891,22 +913,20 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
         raise FlowError(f"expected_main_head_sha {base!r} is not a 40-hex SHA")
 
     before = set(list_branches(repo))
+    before_worktrees = set(worktree_branches(repo))
     head_ref = git_raw(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
     main_branch = decode(head_ref.stdout).strip() if head_ref.returncode == 0 else None
     used = a.backend
     notes: List[str] = []
     created_ws_id: Optional[str] = None
     created_wt: Optional[Path] = None
-    create_attempted = False
     proj_id: Optional[str] = None
     try:
         if a.backend in ("paseo", "auto"):
             try:
-                create_attempted = True
                 proj_id, created_ws_id, created_wt = paseo_create_worktree(ctx, repo, branch, base, a.background)
                 used = "paseo"
             except PaseoUnavailable as exc:
-                create_attempted = False
                 if a.backend == "paseo":
                     raise FlowError(f"--backend paseo failed hard: {exc}")
                 notes.append(f"auto backend fell back to git worktree: {exc}")
@@ -917,7 +937,6 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
             if candidate_wt.exists() and (not candidate_wt.is_dir() or any(candidate_wt.iterdir())):
                 raise FlowError(f"worktree directory {candidate_wt} already exists and is not empty")
             candidate_wt.parent.mkdir(parents=True, exist_ok=True)
-            create_attempted = True
             res = git_raw(repo, "worktree", "add", "-b", branch, str(candidate_wt), base)
             if res.returncode != 0:
                 raise FlowError(f"git worktree add failed: {decode(res.stderr).strip()}")
@@ -935,8 +954,7 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
             notes.append("--apply-dirty-patch ignored: main repository is clean")
     except FlowError as exc:
         created_ws_id = created_ws_id or getattr(exc, "workspace_id", None)
-        _rollback_isolation(ctx, repo, created_ws_id, created_wt, branch if create_attempted else None,
-                            before, main_branch)
+        _rollback_isolation(ctx, repo, created_ws_id, created_wt, branch, before, before_worktrees, main_branch)
         raise
     ws_id = created_ws_id
 

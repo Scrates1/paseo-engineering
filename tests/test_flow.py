@@ -484,6 +484,34 @@ class PaseoBackendTest(FlowTestBase):
         self.assertNotEqual(self.git(self.repo, "branch", "--list", "concurrent/task"), "")
         self.assertEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
 
+    def _race_branch_creation(self, branch):
+        """Make a concurrent task create ``branch`` right after isolate's existence pre-check."""
+        real = flow.branch_exists
+        tree = self.git(self.repo, "rev-parse", "HEAD^{tree}")
+        foreign = self.git(self.repo, "commit-tree", tree, "-p", "HEAD", "-m", "concurrent task commit")
+        state = {"armed": True}
+
+        def racing(repo, name):
+            result = real(repo, name)
+            if state["armed"] and name == branch and not result:
+                state["armed"] = False
+                self.git(self.repo, "branch", branch, foreign)
+            return result
+
+        return mock.patch.object(flow, "branch_exists", side_effect=racing), foreign
+
+    def test_rollback_never_deletes_branch_preempted_by_concurrent_task(self) -> None:
+        self.gear1_ready()
+        for backend, branch in (("git", "fix/race-git"), ("paseo", "fix/race-paseo")):
+            with self.subTest(backend=backend):
+                patcher, foreign = self._race_branch_creation(branch)
+                with patcher:
+                    self.reject("isolate", "--slice", "main-fix", "--branch", branch, "--backend", backend)
+                self.assertEqual(self.git(self.repo, "rev-parse", f"refs/heads/{branch}"), foreign)
+                self.assertNotIn("main-fix", self.state()["slices"])
+                self.assertEqual(self.git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertFalse((self.run_dir / "worktrees" / "main-fix").exists())
+
     def test_paseo_workspace_without_cwd_is_archived_and_branch_removed(self) -> None:
         self.gear1_ready()
         os.environ["MOCK_PASEO_MODE"] = "no-cwd"
@@ -573,9 +601,9 @@ class PaseoBackendTest(FlowTestBase):
                 self.reject(*args, contains=needle)
         os.environ["MOCK_PASEO_PROVIDERS"] = json.dumps({"codex": ["gpt-6.1-sol"]})
         for listing, needle in (
-            ('[{"provider": "codex", "status": "available"}, "junk"]', "malformed provider entry"),
-            ('[{"provider": "codex", "status": "available"}, {"status": "available"}]', "valid string identifier"),
-            ('[{"provider": "codex", "status": "available"}, {"provider": 5, "status": "offline"}]',
+            ('[{"provider": "codex", "status": "available", "enabled": "Enabled"}, "junk"]', "malformed provider entry"),
+            ('[{"provider": "codex", "status": "available", "enabled": "Enabled"}, {"status": "available"}]', "valid string identifier"),
+            ('[{"provider": "codex", "status": "available", "enabled": "Enabled"}, {"provider": 5, "status": "offline"}]',
              "valid string identifier"),
         ):
             with self.subTest(listing=listing):
@@ -604,6 +632,9 @@ class PaseoBackendTest(FlowTestBase):
             ({"provider": "antigravity", "status": "available", "enabled": "maybe"}, "invalid enabled flag"),
             ({"provider": "antigravity", "status": "unavailable", "enabled": 1}, "invalid enabled flag"),
             ({"provider": "antigravity", "status": "unavailable", "enabled": None}, "invalid enabled flag"),
+            ({"provider": "antigravity", "status": "unavailable", "enabled": ""}, "invalid enabled flag"),
+            ({"provider": "antigravity", "status": "unavailable"}, "lacks an explicit enabled flag"),
+            ({"provider": "antigravity", "status": "available"}, "lacks an explicit enabled flag"),
         ]
         for entry, needle in bad:
             with self.subTest(entry=entry):
@@ -611,6 +642,8 @@ class PaseoBackendTest(FlowTestBase):
                 err = self.reject(*args, contains=needle)
                 self.assertIn("REJECTED", err)
         self.assertEqual(self.slice("main-fix")["state"], "IMPLEMENTING")
+        os.environ["MOCK_PASEO_PROVIDER_LS"] = json.dumps([{"provider": "codex", "status": "available"}])
+        self.reject(*args, contains="lacks an explicit enabled flag")
         # Real Paseo listings: unconfigured plugins report status error/unavailable or are disabled -> skipped.
         os.environ["MOCK_PASEO_PROVIDER_LS"] = json.dumps([
             codex,
