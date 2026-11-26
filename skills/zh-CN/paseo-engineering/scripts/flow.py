@@ -186,7 +186,8 @@ def is_ancestor(repo: Any, ancestor: str, descendant: str) -> bool:
 
 
 def wt_is_clean(wt: Any) -> bool:
-    return git_out(wt, "status", "--porcelain") == ""
+    # -uall overrides a repository-level status.showUntrackedFiles=no that would hide untracked files.
+    return git_bytes(wt, "status", "--porcelain=v1", "-z", "-uall") == b""
 
 
 def diff_sha(wt: Any, base: str, tip: str) -> str:
@@ -204,9 +205,10 @@ def compute_repo_snapshot(repo_root: Any) -> Dict[str, Any]:
     head = git_out(repo, "rev-parse", "--verify", "HEAD")
     status = git_bytes(repo, "status", "--porcelain=v1", "-z", "-uall")
     diff = git_bytes(repo, "diff", "--binary", "--no-ext-diff", "--no-color", "HEAD")
+    staged = git_bytes(repo, "diff", "--cached", "--binary", "--no-ext-diff", "--no-color", "HEAD")
     others = git_bytes(repo, "ls-files", "--others", "--exclude-standard", "-z")
     h = hashlib.sha256()
-    for label, blob in ((b"status", status), (b"diff", diff)):
+    for label, blob in ((b"status", status), (b"diff", diff), (b"staged", staged)):
         h.update(label + b"\0" + str(len(blob)).encode() + b"\0" + blob)
     rels = sorted(p for p in others.split(b"\0") if p)
     for rel in rels:
@@ -430,8 +432,26 @@ def paseo_create_worktree(ctx: Ctx, repo: Path, branch: str, base: str, backgrou
     if not ws_id or not cwd:
         err = FlowError(f"paseo workspace create returned no workspaceId/cwd: {ws!r}")
         err.workspace_id = ws_id  # type: ignore[attr-defined]  # caller archives what was created
+        err.worktree = _lookup_workspace_cwd(ctx, ws_id) if ws_id else None  # type: ignore[attr-defined]
         raise err
     return project_id, ws_id, Path(cwd)
+
+
+def _lookup_workspace_cwd(ctx: Ctx, ws_id: str) -> Optional[Path]:
+    """Resolve a workspace's checkout path strictly by its id via ``paseo workspace ls --json``."""
+    try:
+        listing = parse_json_output(run_paseo(ctx, ["workspace", "ls", "--json"]))
+    except FlowError:
+        return None
+    if isinstance(listing, dict):
+        listing = listing.get("workspaces")
+    if not isinstance(listing, list):
+        return None
+    for item in listing:
+        if isinstance(item, dict) and ws_id in (item.get("workspaceId"), item.get("id")):
+            cwd = pick_field(item, "cwd", "worktreeRoot", "path")
+            return Path(cwd) if cwd else None
+    return None
 
 
 # --------------------------------------------------------------------------------------------
@@ -827,36 +847,36 @@ def _rollback_isolation(
     repo: Path,
     ws_id: Optional[str],
     wt: Optional[Path],
-    branch: str,
     before_branches: "set[str]",
     before_worktrees: "set[Path]",
     main_branch: Optional[str],
 ) -> None:
     """Undo ONLY what this isolate call actually created.
 
-    A branch is deleted only if it is bound (per ``git worktree list --porcelain``) to a worktree this
-    call created; if no worktree was created, no branch is ever deleted. Pre-existing directories and
-    unrelated/concurrent branches are never touched.
+    ``owned_wt`` is the created worktree unless it was registered before this call (then nothing about
+    it -- workspace, directory, or branch -- is touched). A branch is deleted only if
+    ``git worktree list --porcelain`` binds it to ``owned_wt``; branches are never guessed by name.
     """
-    owned: List[str] = []
-    if wt is not None or ws_id:
-        listing = worktree_branches(repo)
-        if wt is not None:
-            bound = [listing.get(wt.resolve())]
-        else:  # paseo returned a workspace id without a cwd: the new worktree carrying our branch
-            bound = [b for p, b in listing.items() if p not in before_worktrees and b == branch]
-        for name in bound:
-            if name and name != main_branch and name not in before_branches and name not in owned:
-                owned.append(name)
+    owned_wt: Optional[Path] = None
+    if wt is not None:
+        resolved = wt.resolve()
+        if resolved in before_worktrees:
+            ws_id = None  # never archive/remove a pre-existing user worktree
+        else:
+            owned_wt = resolved
+    owned_branch: Optional[str] = None
+    if owned_wt is not None:
+        bound = worktree_branches(repo).get(owned_wt)
+        if bound and bound not in before_branches and bound != main_branch:
+            owned_branch = bound
     if ws_id:
         with contextlib.suppress(FlowError):
             run_paseo(ctx, ["workspace", "archive", ws_id])
-    if wt is not None and wt.exists():
-        git_raw(repo, "worktree", "remove", "--force", str(wt))
+    if owned_wt is not None and owned_wt.exists():
+        git_raw(repo, "worktree", "remove", "--force", str(owned_wt))
     git_raw(repo, "worktree", "prune")
-    for name in owned:
-        if branch_exists(repo, name):
-            git_raw(repo, "branch", "-D", name)
+    if owned_branch and branch_exists(repo, owned_branch):
+        git_raw(repo, "branch", "-D", owned_branch)
 
 
 def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
@@ -926,6 +946,12 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
             try:
                 proj_id, created_ws_id, created_wt = paseo_create_worktree(ctx, repo, branch, base, a.background)
                 used = "paseo"
+                if created_wt.resolve() in before_worktrees:
+                    foreign = created_wt
+                    created_wt, created_ws_id = None, None  # not ours: never archive/remove/delete-branch
+                    raise FlowError(
+                        f"paseo returned pre-existing worktree {foreign} instead of a new one; refusing to adopt it"
+                    )
             except PaseoUnavailable as exc:
                 if a.backend == "paseo":
                     raise FlowError(f"--backend paseo failed hard: {exc}")
@@ -954,7 +980,8 @@ def cmd_isolate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
             notes.append("--apply-dirty-patch ignored: main repository is clean")
     except FlowError as exc:
         created_ws_id = created_ws_id or getattr(exc, "workspace_id", None)
-        _rollback_isolation(ctx, repo, created_ws_id, created_wt, branch, before, before_worktrees, main_branch)
+        created_wt = created_wt or getattr(exc, "worktree", None)
+        _rollback_isolation(ctx, repo, created_ws_id, created_wt, before, before_worktrees, main_branch)
         raise
     ws_id = created_ws_id
 
@@ -1211,9 +1238,12 @@ def cmd_integrate(ctx: Ctx, st: Dict[str, Any], a: argparse.Namespace) -> str:
         target = Path(a.into_worktree).expanduser().resolve()
         if not target.is_dir():
             raise FlowError(f"--into-worktree {target} does not exist")
-        if target == repo:
+        top = Path(git_out(target, "rev-parse", "--show-toplevel")).resolve()
+        if target != top:
+            raise FlowError(f"--into-worktree must be a worktree top-level directory (got subdirectory of {top})")
+        if top == repo.resolve():
             raise FlowError("--into-worktree must be a separate clean worktree, not the main repository")
-        if any(Path(s["worktree"]).resolve() == target for s in st["slices"].values() if s.get("worktree")):
+        if any(Path(s["worktree"]).resolve() == top for s in st["slices"].values() if s.get("worktree")):
             raise FlowError("--into-worktree must not be a slice worktree")
         if git_common_dir(target) != git_common_dir(repo):
             raise FlowError(f"--into-worktree {target} is not a worktree of {repo}")

@@ -75,13 +75,23 @@ def out(obj):
 
 if argv[:2] == ["project", "create"]:
     out({"projectId": "prj_mock", "path": argv[-1]})
+if argv[:2] == ["workspace", "ls"]:
+    items = [{"workspaceId": k, "cwd": v} for k, v in db.items()]
+    out({"workspaces": items} if os.environ.get("MOCK_PASEO_WS_WRAP") else items)
 if argv[:2] == ["workspace", "create"]:
     repo, branch, base = opt("--path"), opt("--new-branch"), opt("--base")
+    if mode == "existing-cwd":
+        ws_id = "wks_%d" % (len(db) + 1)
+        db[ws_id] = os.environ["MOCK_PASEO_EXISTING_CWD"]
+        db_path.write_text(json.dumps(db))
+        out({"workspaceId": ws_id, "cwd": db[ws_id]})
+    if mode == "no-cwd-rename-concurrent":
+        subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", branch, str(root / "concurrent-wt"), base])
     if mode == "concurrent-branch":
         subprocess.run(["git", "-C", repo, "branch", "other/concurrent", base])
         sys.stderr.write("Error: internal workspace failure\n")
         sys.exit(1)
-    actual = branch + "-1" if mode == "rename-branch" else branch
+    actual = branch + "-1" if mode in ("rename-branch", "no-cwd-rename-concurrent") else branch
     ws_id = "wks_%d" % (len(db) + 1)
     wt = root / "worktrees" / ws_id
     wt.parent.mkdir(parents=True, exist_ok=True)
@@ -92,7 +102,7 @@ if argv[:2] == ["workspace", "create"]:
         sys.exit(1)
     db[ws_id] = str(wt)
     db_path.write_text(json.dumps(db))
-    if mode == "no-cwd":
+    if mode in ("no-cwd", "no-cwd-rename-concurrent"):
         out({"workspaceId": ws_id})
     out({"workspaceId": ws_id, "cwd": str(wt), "background": "--background" in argv})
 if argv[:2] == ["workspace", "archive"]:
@@ -522,6 +532,51 @@ class PaseoBackendTest(FlowTestBase):
         self.assertEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
         self.assertNotIn("wks_1", self.git(self.repo, "worktree", "list"))
         self.assertNotIn("main-fix", self.state()["slices"])
+
+    def test_paseo_returning_pre_existing_worktree_is_never_cleaned_up(self) -> None:
+        self.gear1_ready()
+        user_wt = self.tmp / "user-wip"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "user/wip", str(user_wt))
+        (user_wt / "app.py").write_text("uncommitted user edit\n")
+        (user_wt / "notes.txt").write_text("untracked notes\n")
+        os.environ["MOCK_PASEO_MODE"] = "existing-cwd"
+        os.environ["MOCK_PASEO_EXISTING_CWD"] = str(user_wt)
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                    contains="pre-existing worktree")
+        self.assertEqual((user_wt / "app.py").read_text(), "uncommitted user edit\n")
+        self.assertEqual((user_wt / "notes.txt").read_text(), "untracked notes\n")
+        self.assertIn(str(user_wt), self.git(self.repo, "worktree", "list"))
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "user/wip"), "")
+        self.assertFalse([c for c in self.calls() if c["argv"][:2] == ["workspace", "archive"]])
+        self.assertNotIn("main-fix", self.state()["slices"])
+
+    def test_missing_cwd_resolved_by_workspace_id_not_by_branch_name(self) -> None:
+        self.gear1_ready()
+        os.environ["MOCK_PASEO_MODE"] = "no-cwd-rename-concurrent"
+        os.environ["MOCK_PASEO_WS_WRAP"] = "1"
+        concurrent = self.mock_root / "concurrent-wt"
+        self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                    contains="no workspaceId/cwd")
+        self.assertIn(["workspace", "ls", "--json"], [c["argv"] for c in self.calls()])
+        self.assertIn(["workspace", "archive", "wks_1"], [c["argv"] for c in self.calls()])
+        self.assertFalse((self.mock_root / "worktrees" / "wks_1").exists())
+        self.assertEqual(self.git(self.repo, "branch", "--list", "fix/answer-1"), "")
+        # The concurrent worktree that happens to carry the requested branch name is untouched.
+        self.assertTrue(concurrent.is_dir())
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
+        self.assertIn(str(concurrent), self.git(self.repo, "worktree", "list"))
+
+    def test_missing_cwd_unresolvable_archives_workspace_but_deletes_no_branch(self) -> None:
+        self.gear1_ready()
+        self.git(self.repo, "branch", "unrelated/keep")
+        os.environ["MOCK_PASEO_MODE"] = "no-cwd"
+        with mock.patch.object(flow, "_lookup_workspace_cwd", return_value=None):
+            self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                        contains="no workspaceId/cwd")
+        self.assertIn(["workspace", "archive", "wks_1"], [c["argv"] for c in self.calls()])
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "unrelated/keep"), "")
+        # Ownership cannot be proven without the worktree path, so the requested branch is left alone.
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "fix/answer"), "")
 
     def test_missing_binary(self) -> None:
         self.gear1_ready()
@@ -1150,6 +1205,65 @@ class PostReviewHardeningTest(FlowTestBase):
         blocked("integrate", "--slice", "a", "--user-override", "merge it anyway")
         self.assertEqual(self.slice("a")["state"], "SPIKE_AUDITED")
         self.assertNotEqual(self.git(self.repo, "branch", "--list", "spike/a"), "")
+
+
+class GitEdgeCaseTest(FlowTestBase):
+    def test_wt_is_clean_ignores_show_untracked_files_config(self) -> None:
+        self.git(self.repo, "config", "status.showUntrackedFiles", "no")
+        (self.repo / "stray.txt").write_text("x")
+        self.assertEqual(self.git(self.repo, "status", "--porcelain"), "")
+        self.assertFalse(flow.wt_is_clean(self.repo))
+        (self.repo / "stray.txt").unlink()
+        self.assertTrue(flow.wt_is_clean(self.repo))
+        self.gear1_ready()
+        self.implement("main-fix", "fix/answer")
+        (self.wt("main-fix") / "untracked.txt").write_text("hidden by config\n")
+        self.reject("enter-review", "--slice", "main-fix", "--reviewer-model", REVIEWER, contains="uncommitted")
+        (self.wt("main-fix") / "untracked.txt").unlink()
+        self.flow("enter-review", "--slice", "main-fix", "--reviewer-model", REVIEWER)
+
+    def test_snapshot_covers_staged_index_content(self) -> None:
+        (self.repo / "README.md").write_text("v2\n")
+        self.git(self.repo, "add", "README.md")
+        (self.repo / "README.md").write_text("v3\n")
+        status1 = self.git(self.repo, "status", "--porcelain")
+        self.assertEqual(status1, "MM README.md")
+        s1 = flow.compute_repo_snapshot(self.repo)
+        self.flow("init", "--repo", str(self.repo))
+        before = self.ledger_snapshot()
+        blob = subprocess.run(["git", "-C", str(self.repo), "hash-object", "-w", "--stdin"], input=b"v2-other\n",
+                              stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+        self.git(self.repo, "update-index", "--cacheinfo", f"100644,{blob},README.md")
+        self.assertEqual(self.git(self.repo, "status", "--porcelain"), status1)
+        self.assertEqual((self.repo / "README.md").read_text(), "v3\n")
+        s2 = flow.compute_repo_snapshot(self.repo)
+        self.assertEqual(s1["head_sha"], s2["head_sha"])
+        self.assertNotEqual(s1["diff_hash"], s2["diff_hash"])
+        self.reject("triage", "--symptom", "s", "--root", "r", "--gear", "1", contains="working tree changed")
+        self.assertEqual(self.ledger_snapshot(), before)
+
+    def test_into_worktree_rejects_subdirectories(self) -> None:
+        self.commit(self.repo, "sub/inner.txt", "inner\n", "add subdir")
+        self.gear1_ready()
+        self.implement("main-fix", "fix/answer")
+        self.flow("enter-review", "--slice", "main-fix", "--reviewer-model", REVIEWER)
+        self.flow("record-review", "--slice", "main-fix", "--verdict", "PASS", "--blockers", "0")
+        integ = self.tmp / "integration"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(integ), self.state()["expected_main_head_sha"])
+        main_head = self.git(self.repo, "rev-parse", "HEAD")
+        for bad in (self.repo / "sub", integ / "sub", self.wt("main-fix") / "sub"):
+            with self.subTest(target=str(bad)):
+                before = self.ledger_snapshot()
+                self.reject("integrate", "--slice", "main-fix", "--into-worktree", str(bad), contains="top-level")
+                self.assertEqual(self.ledger_snapshot(), before)
+        self.reject("integrate", "--slice", "main-fix", "--into-worktree", str(self.repo), contains="main repository")
+        self.reject("integrate", "--slice", "main-fix", "--into-worktree", str(self.wt("main-fix")),
+                    contains="slice worktree")
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), main_head)
+        self.assertEqual(self.slice("main-fix")["state"], "REVIEW_PASSED")
+        self.flow("integrate", "--slice", "main-fix", "--into-worktree", str(integ))
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), main_head)
+        self.assertEqual(self.state()["state"], "MERGED_PENDING_VERIFY")
 
 
 @unittest.skipIf(os.name == "nt", "POSIX permissions")
