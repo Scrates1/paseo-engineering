@@ -673,6 +673,55 @@ class PaseoBackendTest(FlowTestBase):
                     contains="silent rename")
         self.assertEqual(self.git(self.repo, "branch", "--list", "fix/other-1"), "")
 
+    def test_rollback_keeps_branch_when_worktree_removal_fails(self) -> None:
+        self.gear1_ready()
+        wt = self.mock_root / "worktrees" / "wks_1"
+        real_run_paseo = flow.run_paseo
+        real_git_raw = flow.git_raw
+        update_ref_deletes = []
+
+        def locking_archive(ctx, argv):
+            if argv[:2] == ["workspace", "archive"]:
+                self.git(self.repo, "worktree", "lock", "--reason", "in use", str(wt))
+                return "{}"
+            return real_run_paseo(ctx, argv)
+
+        def spying_git_raw(repo, *args, **kw):
+            if args[:2] == ("update-ref", "-d"):
+                update_ref_deletes.append(args)
+            return real_git_raw(repo, *args, **kw)
+
+        os.environ["MOCK_PASEO_MODE"] = "rename-branch"
+        with mock.patch.object(flow, "run_paseo", side_effect=locking_archive), \
+                mock.patch.object(flow, "git_raw", side_effect=spying_git_raw):
+            err = self.reject("isolate", "--slice", "main-fix", "--branch", "fix/answer", "--backend", "paseo",
+                              contains="rollback cleanup incomplete")
+        self.assertIn("silent rename", err)
+        self.assertIn("fix/answer-1", err)
+        self.assertEqual(update_ref_deletes, [])
+        self.assertTrue(wt.is_dir())
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "fix/answer-1"), "")
+        self.assertIn(str(wt), self.git(self.repo, "worktree", "list"))
+        self.assertNotIn("main-fix", self.state()["slices"])
+
+        # Listing failure after cleanup is treated the same way: the branch is kept.
+        self.git(self.repo, "worktree", "unlock", str(wt))
+        self.git(self.repo, "worktree", "remove", "--force", str(wt))
+        self.git(self.repo, "branch", "-D", "fix/answer-1")
+        state = {"calls": 0}
+
+        def flaky_listing(repo, *args, **kw):
+            if args[:2] == ("worktree", "list"):
+                state["calls"] += 1
+                if state["calls"] >= 3:  # pre-check and ownership lookup succeed; the post-cleanup check fails
+                    return subprocess.CompletedProcess(["git"], 128, b"", b"fatal: simulated listing failure")
+            return real_git_raw(repo, *args, **kw)
+
+        with mock.patch.object(flow, "git_raw", side_effect=flaky_listing):
+            self.reject("isolate", "--slice", "main-fix", "--branch", "fix/other", "--backend", "paseo",
+                        contains="rollback cleanup incomplete")
+        self.assertNotEqual(self.git(self.repo, "branch", "--list", "fix/other-1"), "")
+
     def test_missing_binary(self) -> None:
         self.gear1_ready()
         os.environ["PASEO_BIN"] = str(self.tmp / "nope" / "paseo")

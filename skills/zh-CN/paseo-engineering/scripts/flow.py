@@ -892,6 +892,18 @@ def _rollback_isolation(
     if owned_wt.exists():
         git_raw(repo, "worktree", "remove", "--force", str(owned_wt))
     git_raw(repo, "worktree", "prune")
+    try:
+        after: Optional[Dict[Path, Tuple[Optional[str], Optional[str]]]] = worktree_branches(repo, strict=True)
+    except FlowError:
+        after = None
+    if (
+        after is None
+        or owned_wt.exists()
+        or owned_wt in after
+        or (owned_branch is not None and owned_branch in [b for b, _ in after.values()])
+    ):
+        # Never delete a branch that may still be checked out (e.g. locked worktree, failed listing).
+        return f"rollback cleanup incomplete: worktree {owned_wt} or branch {owned_branch!r} still active"
     if owned_branch:
         git_raw(repo, "update-ref", "-d", f"refs/heads/{owned_branch}", str(owned_oid))
     return None
